@@ -1,3 +1,17 @@
+import telethon
+import sys
+import os
+
+tg_session = os.environ.get("TG_SESSION", "")
+
+print("\n==== DEBUG TELETHON ====")
+print("Telethon version:", telethon.__version__)
+print("Python version:", sys.version)
+print("TG_SESSION length:", len(tg_session))
+print("First 10:", tg_session[:10])
+print("Last 10:", tg_session[-10:])
+print("========================\n")
+
 import asyncio
 import os
 import re
