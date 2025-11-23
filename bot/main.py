@@ -194,3 +194,5 @@ if __name__ == "__main__":
     asyncio.run(client.start())
     with client:
         client.loop.run_until_complete(main())
+import telethon
+print("Telethon version:", telethon.__version__)
