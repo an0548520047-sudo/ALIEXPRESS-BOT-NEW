@@ -29,23 +29,6 @@ Optional overrides:
 - `MIN_VIEWS` (default: `1500`)
 - `MAX_MESSAGES_PER_CHANNEL` (default: `80`)
 - `DRY_RUN` (default: `false`) – when `true`, the bot logs what it would post without sending messages.
-- `MAX_POSTS_PER_RUN` (default: `5`) – hard cap on how many posts are sent per workflow run.
-- `MESSAGE_COOLDOWN_SECONDS` (default: `5`) – pause between posts to avoid flooding or hitting Telegram limits.
-- `MAX_MESSAGE_AGE_MINUTES` (default: `240`) – skip deals older than this age in minutes.
-- `KEYWORD_ALLOWLIST` (optional) – comma-separated keywords that must appear; if empty the built-in defaults are used.
-- `KEYWORD_BLOCKLIST` (optional) – comma-separated keywords that will immediately skip a post.
-
-### Deal copy template (Hebrew)
-The rewrite prompt now forces a concise Israeli-style template so posts are ready to paste:
-
-1) Opening question that feels relatable to the product.
-2) One short line presenting the product as the answer.
-3) 3–6 short bullets: model/type, real advantages, key specs/uses.
-4) Price/rating/orders lines only when present in the source (💰/⭐/📦).
-5) Coupons line only if coupon data exists (🎁, include order if multiple codes).
-6) Link block: "👇 לקנייה באליאקספרס:" followed by the affiliate URL on the next line.
-
-Guardrails: Hebrew only, 1–3 emojis total, no made-up data, and skips sections when details are missing.
 
 You can copy `.env.example` to `.env` for local testing and fill in your values.
 
@@ -62,12 +45,6 @@ export TG_TARGET_CHANNEL=@your_channel
 export AFFILIATE_PREFIX="https://example.com/deeplink?url="
 export OPENAI_API_KEY=...
 export DRY_RUN=true  # optional safety switch while testing locally
-# Optional fine-tuning
-export MAX_POSTS_PER_RUN=5
-export MESSAGE_COOLDOWN_SECONDS=5
-export MAX_MESSAGE_AGE_MINUTES=240
-export KEYWORD_ALLOWLIST="מבצע,קופון"
-export KEYWORD_BLOCKLIST="adult"
 python bot/main.py
 ```
 
@@ -75,7 +52,6 @@ python bot/main.py
 - The bot only posts a product once per target channel by tagging each message with `(id:<product_id>)`.
 - Adjust the cron schedule in `.github/workflows/telegram_affiliate_bot.yml` if you want a different posting cadence.
 - Keep secrets out of version control; the workflow reads everything from GitHub Secrets.
-- Use the new keyword allow/block lists and age + per-run caps to keep the feed clean and reduce noise.
 
 ## מה עכשיו? (צ'ק־ליסט מהיר)
 1) ודא שכל ה-Secrets קיימים ברפו תחת **Settings → Secrets and variables → Actions** בשמות המדויקים שמופיעים בטבלה למעלה.
