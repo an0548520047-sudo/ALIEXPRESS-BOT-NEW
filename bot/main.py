@@ -82,21 +82,21 @@ async def already_posted_recently(product_id: str) -> bool:
 
 def rewrite_caption(orig_text, affiliate_url):
     prompt = (
-        "כתוב פוסט דיל טבעי וקליל בעברית, כאילו חבר כותב לקבוצה ולא בעל עסק."
-        " לא להעתיק מהטקסט, רק השראה; תכתוב כאילו הזמנת, ממליץ בגובה העיניים ומכניס הערה אישית קטנה או בדיחה."
-        " תשתמש ב-1-2 אימוג'ים, תסיים בלינק כפי שמצוין."
-        f"\nבסוף הפוסט: '👇 לקנייה באליאקספרס:' ואז את הלינק {affiliate_url}\n"
-        "הנה מידע השראה בלבד:\n"
+        "כתוב פוסט דיל קצר בעברית ממליץ, כאילו חבר אמיתי משתף בקבוצת ווטסאפ/טלגרם. "
+        "אסור להמציא שום מידע, אין להוסיף נתונים חדשים! תתייחס אך ורק לפרטים שמופיעים בטקסט של הדיל המקורי. "
+        "תוכל לנסח מחדש, להוסיף טון חברי וישראלי, 1-2 אימוג׳ים בלבד, אבל חובתך לכתוב רק מה שכתוב בטקסט המקורי. "
+        f"בסוף הפוסט כתוב תמיד:\n👇 לקנייה באליאקספרס:\n{affiliate_url}\n"
+        "הנה הדיל המקורי (המידע היחיד שמותר להשתמש בו):\n"
         f"{orig_text}"
     )
     response = oa_client.chat.completions.create(
         model=openai_model,
         messages=[
-            {"role": "system", "content": "אתה מעצב פוסטים בעברית חברתית לדילים, כולל טון אישי."},
+            {"role": "system", "content": "אל תמציא או תוסיף מידע – חובה להשתמש רק במה שמופיע בטקסט הדיל המקורי!"},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.9,
-        max_tokens=410,
+        temperature=0.6,
+        max_tokens=390,
     )
     return response.choices[0].message.content.strip()
 
@@ -164,4 +164,3 @@ if __name__ == "__main__":
         await client.start()
         await main()
     asyncio.run(runner())
-
