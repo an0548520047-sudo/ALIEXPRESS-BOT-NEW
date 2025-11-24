@@ -1,0 +1,45 @@
+name: Telegram Affiliate Bot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      TG_SESSION: ${{ secrets.TG_SESSION }}
+      TG_SOURCE_CHANNELS: ${{ secrets.TG_SOURCE_CHANNELS }}
+      TG_TARGET_CHANNEL: ${{ secrets.TG_TARGET_CHANNEL }}
+      AFFILIATE_PREFIX: ${{ secrets.AFFILIATE_PREFIX }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: "gpt-4.1-mini"
+      MIN_VIEWS: "1500"
+      MAX_MESSAGES_PER_CHANNEL: "80"
+      MAX_POSTS_PER_RUN: "5"
+      MESSAGE_COOLDOWN_SECONDS: "5"
+      MAX_MESSAGE_AGE_MINUTES: "240"
+      KEYWORD_ALLOWLIST: ${{ secrets.KEYWORD_ALLOWLIST || '' }}
+      KEYWORD_BLOCKLIST: ${{ secrets.KEYWORD_BLOCKLIST || '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        run: |
+          python bot/main.py
