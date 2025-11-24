@@ -1,9 +1,16 @@
 import telethon
 import sys
 import os
+import asyncio
+import re
+from urllib.parse import quote
+from openai import OpenAI
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.custom.message import Message
 
+# ==== DEBUG ====
 tg_session = os.environ.get("TG_SESSION", "")
-
 print("\n==== DEBUG TELETHON ====")
 print("Telethon version:", telethon.__version__)
 print("Python version:", sys.version)
@@ -12,52 +19,30 @@ print("First 10:", tg_session[:10])
 print("Last 10:", tg_session[-10:])
 print("========================\n")
 
-import asyncio
-import re
-from urllib.parse import quote
-
-from openai import OpenAI
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.tl.custom.message import Message
-
-# ============ ENV / SECRETS ============
-
+# ==== ENV ====
 def _must_get_env(name: str) -> str:
     value = os.getenv(name)
     if value is None or value == "":
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
-def _get_bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    return normalized in {"1", "true", "yes", "y", "on"}
-
 tg_api_id = int(_must_get_env("TG_API_ID"))
 tg_api_hash = _must_get_env("TG_API_HASH")
 tg_session = _must_get_env("TG_SESSION")
-
 tg_source_channels = [
     c.strip() for c in _must_get_env("TG_SOURCE_CHANNELS").split(",") if c.strip()
 ]
-
 tg_target_channel = _must_get_env("TG_TARGET_CHANNEL")
 affiliate_prefix = _must_get_env("AFFILIATE_PREFIX")
 openai_api_key = _must_get_env("OPENAI_API_KEY")
-
 openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 min_views = int(os.getenv("MIN_VIEWS", "1500"))
-max_messages_per_channel = int(os.getenv("MAX_MESSAGES_PER_CHANNEL", "80"))
-dry_run = _get_bool_env("DRY_RUN", False)
-
+max_messages_per_channel = int(os.getenv("MAX_MESSAGES_PER_CHANNEL", "70"))
+dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
 client = TelegramClient(StringSession(tg_session), tg_api_id, tg_api_hash)
 oa_client = OpenAI(api_key=openai_api_key)
 
-# ============ UTILITIES ============
-
+# ==== REGEX ====
 ali_regex = re.compile(r"https?://[^\s]*aliexpress\.com[^\s]*", re.IGNORECASE)
 
 def extract_aliexpress_links(text: str) -> list[str]:
@@ -78,25 +63,26 @@ def make_affiliate_link(original_url: str) -> str:
     encoded = quote(original_url, safe="")
     return f"{affiliate_prefix}{encoded}"
 
+# ==== PROMPT FOR COPY ====
 def rewrite_caption(orig_text: str, affiliate_url: str) -> str:
     prompt = (
-        "אתה כותב פוסטים לקבוצת טלגרם של דילים ומבצעים בעברית.\n\n"
-        "קבל טקסט מקורי של פוסט (להשראה בלבד) ולינק מוצר. תכתוב פוסט חדש, מקורי וקצר (3–6 שורות) בעברית,\n"
-        "בסגנון קליל ומוכר עם קצת אימוג'ים, שמסביר למה המוצר שימושי או מגניב. אל תעתיק משפטים כפי שהם ואל תזכיר\n"
-        "קבוצות אחרות או את המילה \"אליאקספרס\".\n\n"
-        f"בסוף הפוסט הוסף שורה אחת בדיוק:\n🔗 לינק: {affiliate_url}\n\n"
-        "הטקסט המקורי (רק להשראה):\n"
-        f"{orig_text}\n"
+        "המשימה שלך: כתוב פוסט מגניב לדיל טלגרם בעברית.\n"
+        "פסקה ראשונה: כותרת מפתה בולטת, פלוס אימוג׳י.\n"
+        "פסקה קצרה: למה המוצר מיוחד/שימושי (בלי לחפור).\n"
+        "בסוף: 🔗 לינק למוצר, שורה נפרדת.\n"
+        "השתמש בשפה קלילה, הימנע מהעתקה מילולית. אל תזכיר קבוצות, לא לכתוב 'אליאקספרס'.\n"
+        f"טקסט השראה:\n{orig_text}\n"
     )
     response = oa_client.chat.completions.create(
         model=openai_model,
         messages=[
-            {"role": "system", "content": "אתה כותב קופי בעברית לקבוצת דילים בטלגרם."},
-            {"role": "user", "content": prompt.strip()},
+            {"role": "system", "content": "אתה כותב קופי דילים בעברית לקבוצת טלגרם. הוסף אימוג׳י בשורה הראשונה."},
+            {"role": "user", "content": prompt}
         ],
-        temperature=0.7,
-        max_tokens=400,
+        temperature=0.77,
+        max_tokens=350,
     )
+    # ניתן להדגיש בעזרת סימון ** (כוכבית כפולה)
     return response.choices[0].message.content.strip()
 
 def is_potentially_good_post(msg: Message) -> bool:
@@ -124,8 +110,7 @@ async def already_posted(product_id: str) -> bool:
             return True
     return False
 
-# ============ MAIN FLOW ============
-
+# ==== MAIN FLOW ====
 async def process_channel(channel: str) -> None:
     log_info(f"Scanning source channel: {channel}")
     async for msg in client.iter_messages(channel, limit=max_messages_per_channel):
@@ -148,6 +133,7 @@ async def process_channel(channel: str) -> None:
             log_info(f"OpenAI rewrite error: {exc}")
             new_caption = f"{msg.message}\n\n🔗 לינק: {affiliate_url}"
         final_text = format_message(new_caption, product_id)
+        # שליחת טקסט עם תמונה אם קיימת:
         if dry_run:
             log_info(
                 "DRY_RUN is enabled; skipping send. Would have posted "
@@ -155,8 +141,17 @@ async def process_channel(channel: str) -> None:
             )
             continue
         try:
-            await client.send_message(tg_target_channel, final_text)
-            log_info(f"Posted product_id={product_id} to {tg_target_channel}")
+            if msg.photo:
+                await client.send_file(
+                    tg_target_channel,
+                    msg.photo,
+                    caption=final_text,
+                    force_document=False
+                )
+                log_info(f"Posted (image + text) product_id={product_id} to {tg_target_channel}")
+            else:
+                await client.send_message(tg_target_channel, final_text)
+                log_info(f"Posted (text only) product_id={product_id} to {tg_target_channel}")
         except Exception as exc:
             log_info(f"Error sending message to target channel: {exc}")
 
