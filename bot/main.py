@@ -3,6 +3,7 @@ import sys
 import os
 import asyncio
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote
 from openai import OpenAI
 from telethon import TelegramClient
@@ -22,35 +23,39 @@ print("========================\n")
 # ==== ENV ====
 def _must_get_env(name: str) -> str:
     value = os.getenv(name)
-    if value is None or value == "":
+    if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 tg_api_id = int(_must_get_env("TG_API_ID"))
 tg_api_hash = _must_get_env("TG_API_HASH")
 tg_session = _must_get_env("TG_SESSION")
-tg_source_channels = [
-    c.strip() for c in _must_get_env("TG_SOURCE_CHANNELS").split(",") if c.strip()
-]
+tg_source_channels = [c.strip() for c in _must_get_env("TG_SOURCE_CHANNELS").split(",") if c.strip()]
 tg_target_channel = _must_get_env("TG_TARGET_CHANNEL")
 affiliate_prefix = _must_get_env("AFFILIATE_PREFIX")
 openai_api_key = _must_get_env("OPENAI_API_KEY")
 openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 min_views = int(os.getenv("MIN_VIEWS", "1500"))
-max_messages_per_channel = int(os.getenv("MAX_MESSAGES_PER_CHANNEL", "70"))
-dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+max_messages_per_channel = int(os.getenv("MAX_MESSAGES_PER_CHANNEL", "80"))
+dry_run = _get_bool_env("DRY_RUN", False)
+REPEAT_COOLDOWN_DAYS = int(os.getenv("REPEAT_COOLDOWN_DAYS", "3"))
+
 client = TelegramClient(StringSession(tg_session), tg_api_id, tg_api_hash)
 oa_client = OpenAI(api_key=openai_api_key)
 
 # ==== REGEX ====
 ali_regex = re.compile(r"https?://[^\s]*aliexpress\.com[^\s]*", re.IGNORECASE)
 
-def extract_aliexpress_links(text: str) -> list[str]:
-    if not text:
-        return []
-    return ali_regex.findall(text)
+def extract_links(text):
+    return ali_regex.findall(text) if text else []
 
-def normalize_aliexpress_id(url: str) -> str:
+def get_product_id(url):
     match = re.search(r"/item/(\d+)\.html", url)
     if match:
         return match.group(1)
@@ -59,125 +64,81 @@ def normalize_aliexpress_id(url: str) -> str:
         return match.group(1)
     return url.split("?")[0]
 
-def make_affiliate_link(original_url: str) -> str:
-    encoded = quote(original_url, safe="")
-    return f"{affiliate_prefix}{encoded}"
+def make_affiliate_link(url):
+    return f"{affiliate_prefix}{quote(url, safe='')}"
 
-# ==== PROMPT FOR COPY (מקורי ישראלי) ====
-def rewrite_caption(orig_text: str, affiliate_url: str) -> str:
+def format_message(content, product_id):
+    return f"{content}\n\n(id:{product_id})"
+
+async def already_posted_recently(product_id: str) -> bool:
+    async for msg in client.iter_messages(tg_target_channel, limit=400):
+        if not msg.message or f"(id:{product_id})" not in msg.message:
+            continue
+        if msg.date:
+            days_since = (datetime.now(timezone.utc) - msg.date).days
+            if days_since < REPEAT_COOLDOWN_DAYS:
+                return True
+    return False
+
+def rewrite_caption(orig_text, affiliate_url):
     prompt = (
-        "אתה כותב פוסט דיל לקבוצת דילים ישראלית (וואטסאפ / טלגרם).\n"
-        "הסגנון: קצר, חד, ישראלי, בלי חפירות ובלי שפת פרסום מנופחת.\n"
-        "הפוסט צריך לצאת מוכן אחד-לאחד להעתקה לקבוצה.\n"
-        "כללים לסגנון ולתוצאה:\n"
-        "כתיבה רק בעברית.\n"
-        "טון יומיומי, טבעי, ישראלי, עם הומור קטן ועדין (לא מוגזם, לא צעקני).\n"
-        "להשתמש ב־1 עד 3 אימוג’ים לכל היותר.\n"
-        "משפטים קצרים, בלי פסקאות ארוכות.\n"
-        "בלי 'הדיל הכי מטורף בעולם' ושטויות כאלה – תכל'ס.\n"
-        "מבנה הפוסט (חשוב! תמיד לשמור עליו):\n"
-        "שורת פתיחה – שאלה יומיומית שמישהו רואה ואומר לעצמו 'וואלה, זה אני'.\n"
-        "לדוגמה:\n"
-        "\"עוד פעם נגמר לך הסוללה דווקא בחוץ?\"\n"
-        "\"נמאס לך מה…?\"\n"
-        "\"קרה לך ש…?\"\n"
-        "תבחר שאלה אחת שמתאימה למוצר.\n"
-        "משפט אחד קצר – שמציג את המוצר בתור הפתרון הברור לבעיה מהשאלה.\n"
-        "בולטים תכל'ס על המוצר –\n"
-        "3–6 נקודות, כל נקודה קצרה (עד בערך 7–9 מילים), לדוגמה:\n"
-        "סוג המוצר / דגם\n"
-        "יתרונות אמיתיים (לא הגזמות)\n"
-        "שימושים עיקריים\n"
-        "פרטים טכניים חשובים (קיבולת, וואט, זמן סוללה, תקן, מידות וכו’)\n"
-        "שורת מחיר / דירוג / הזמנות (אם יש במידע):\n"
-        "💰 מחיר אחרי הנחות: XXX ₪\n"
-        "⭐ דירוג: X.X\n"
-        "📦 מס’ הזמנות: XXXX+\n"
-        "אם אין נתון מסוים – לא להמציא, פשוט לדלג.\n"
-        "קופונים (רק אם קיימים במידע):\n"
-        "שורת טקסט קצרה:\n"
-        "🎁 קופונים: ואז ברשימה מסודרת (לפי הסדר שצריך להזין).\n"
-        "אם צריך להזין כמה קופונים ברצף – לציין \"קודם X ואז Y\".\n"
-        "קישור קנייה:\n"
-        "שורה נפרדת עם הטקסט:\n"
-        "👇 לקנייה באליאקספרס:\n"
-        f"{affiliate_url}\n"
-        "דגשים חשובים:\n"
-        "לא להוסיף מידע שלא הופיע במקור.\n"
-        "לא להמציא מחירים, דירוגים או מספר הזמנות.\n"
-        "אם יש מטבע $, אפשר לציין בסוגריים ליד המחיר בש\"ח.\n"
-        "אם כתוב שהמיסים לא כלולים – לציין את זה במשפט קצר.\n"
-        "המטרה: פוסט שנראה כמו דיל אותנטי בקבוצת דילים ישראלית, לא פרסומת רשמית.\n"
-        "בסוף ההנחיות האלה אצרף לך את המידע הגולמי על המוצר (תיאור, מחיר, דירוג, קופונים, קישור וכו’).\n"
-        "על סמך המידע הזה – תיצור פוסט אחד לפי כל הכללים למעלה.\n"
-        "הנה המוצר:\n"
-        f"{orig_text}\n"
+        "כתוב פוסט דיל טבעי וקליל בעברית, כאילו חבר כותב לקבוצה ולא בעל עסק."
+        " לא להעתיק מהטקסט, רק השראה; תכתוב כאילו הזמנת, ממליץ בגובה העיניים ומכניס הערה אישית קטנה או בדיחה."
+        " תשתמש ב-1-2 אימוג'ים, תסיים בלינק כפי שמצוין."
+        f"\nבסוף הפוסט: '👇 לקנייה באליאקספרס:' ואז את הלינק {affiliate_url}\n"
+        "הנה מידע השראה בלבד:\n"
+        f"{orig_text}"
     )
     response = oa_client.chat.completions.create(
         model=openai_model,
         messages=[
-            {"role": "system", "content": "עמוד תמיד בכל הכללים, תכתוב רק בעברית, והפוסט ייראה אותנטי."},
+            {"role": "system", "content": "אתה מעצב פוסטים בעברית חברתית לדילים, כולל טון אישי."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.7,
-        max_tokens=540,
+        temperature=0.9,
+        max_tokens=410,
     )
     return response.choices[0].message.content.strip()
 
-def is_potentially_good_post(msg: Message) -> bool:
+def log_info(msg): print(msg, flush=True)
+
+def is_good_post(msg: Message):
     if not msg.message:
         return False
     text = msg.message.lower()
     keywords = ["₪", "$", "discount", "coupon", "קופון", "דיל", "מבצע", "%", "קוד"]
-    if not any(keyword in text for keyword in keywords):
+    if not any(kw in text for kw in keywords):
         return False
     if msg.views is not None and msg.views < min_views:
         return False
     return True
 
-def format_message(content: str, product_id: str) -> str:
-    return f"{content}\n\n(id:{product_id})"
-
-def log_info(message: str) -> None:
-    print(message, flush=True)
-
-async def already_posted(product_id: str) -> bool:
-    async for msg in client.iter_messages(tg_target_channel, limit=300):
-        if not isinstance(msg, Message) or not msg.message:
-            continue
-        if f"(id:{product_id})" in msg.message:
-            return True
-    return False
-
-# ==== MAIN FLOW ====
-async def process_channel(channel: str) -> None:
-    log_info(f"Scanning source channel: {channel}")
+async def process_channel(channel):
+    log_info(f"== סורק ערוץ: {channel} ==")
     async for msg in client.iter_messages(channel, limit=max_messages_per_channel):
-        if not isinstance(msg, Message) or not msg.message:
+        now = datetime.now()
+        if now.hour < 7 or now.hour >= 24:
+            log_info("לא שולח פוסט - מחוץ לשעות 7:00–00:00")
             continue
-        links = extract_aliexpress_links(msg.message)
+        if not is_good_post(msg):
+            continue
+        links = extract_links(msg.message)
         if not links:
             continue
-        if not is_potentially_good_post(msg):
-            continue
         original_url = links[0]
-        product_id = normalize_aliexpress_id(original_url)
-        if await already_posted(product_id):
-            log_info(f"Already posted product_id={product_id}, skipping")
+        product_id = get_product_id(original_url)
+        if await already_posted_recently(product_id):
+            log_info(f"דיל {product_id} פורסם ב–{REPEAT_COOLDOWN_DAYS} ימים האחרונים, דילוג.")
             continue
         affiliate_url = make_affiliate_link(original_url)
         try:
             new_caption = rewrite_caption(msg.message, affiliate_url)
         except Exception as exc:
-            log_info(f"OpenAI rewrite error: {exc}")
-            new_caption = f"{msg.message}\n\n🔗 לינק: {affiliate_url}"
+            log_info(f"שגיאת OpenAI: {exc}")
+            new_caption = f"{msg.message}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
         final_text = format_message(new_caption, product_id)
-        # שליחת טקסט עם תמונה אם קיימת:
         if dry_run:
-            log_info(
-                "DRY_RUN is enabled; skipping send. Would have posted "
-                f"product_id={product_id} to {tg_target_channel}"
-            )
+            log_info(f"(DRY_RUN) היה נשלח {product_id} לערוץ היעד")
             continue
         try:
             if msg.photo:
@@ -187,12 +148,12 @@ async def process_channel(channel: str) -> None:
                     caption=final_text,
                     force_document=False
                 )
-                log_info(f"Posted (image + text) product_id={product_id} to {tg_target_channel}")
+                log_info(f"*** פורסם (תמונה+טקסט) product_id={product_id} ***")
             else:
                 await client.send_message(tg_target_channel, final_text)
-                log_info(f"Posted (text only) product_id={product_id} to {tg_target_channel}")
+                log_info(f"*** פורסם (טקסט בלבד) product_id={product_id} ***")
         except Exception as exc:
-            log_info(f"Error sending message to target channel: {exc}")
+            log_info(f"שגיאת שליחה: {exc}")
 
 async def main():
     for channel in tg_source_channels:
@@ -203,3 +164,4 @@ if __name__ == "__main__":
         await client.start()
         await main()
     asyncio.run(runner())
+
