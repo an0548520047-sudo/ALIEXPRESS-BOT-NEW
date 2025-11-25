@@ -645,22 +645,46 @@ class DealBot:
             final_text = format_message(final_caption, product_id)
 
             send_success = False
+            media = getattr(msg, "media", None)
+
             if self.config.dry_run:
                 log_info(
                     "DRY_RUN is enabled; skipping send. Would have posted "
-                    f"product_id={product_id} to {self.config.tg_target_channel}"
+                    f"product_id={product_id} to {self.config.tg_target_channel} "
+                    f"with media={'yes' if media else 'no'}"
                 )
                 send_success = True
             else:
-                try:
-                    await self.client.send_message(self.config.tg_target_channel, final_text)
-                    send_success = True
-                    log_info(f"Posted product_id={product_id} to {self.config.tg_target_channel}")
-                except Exception as exc:  # noqa: BLE001
-                    log_info(
-                        "Error sending message to target channel; will not count as sent: "
-                        f"{exc}"
-                    )
+                if media is not None:
+                    try:
+                        await self.client.send_file(
+                            self.config.tg_target_channel,
+                            media,
+                            caption=final_text,
+                        )
+                        send_success = True
+                        log_info(
+                            f"Posted product_id={product_id} to {self.config.tg_target_channel} "
+                            "with source media attached"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log_info(
+                            "Sending with media failed; retrying without attachment: " f"{exc}"
+                        )
+
+                if not send_success:
+                    try:
+                        await self.client.send_message(self.config.tg_target_channel, final_text)
+                        send_success = True
+                        log_info(
+                            f"Posted product_id={product_id} to {self.config.tg_target_channel} "
+                            "(no media)"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log_info(
+                            "Error sending message to target channel; will not count as sent: "
+                            f"{exc}"
+                        )
 
             if send_success:
                 posted_count += 1
