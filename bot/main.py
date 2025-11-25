@@ -76,7 +76,6 @@ async def already_posted_recently(product_id: str) -> bool:
 
 ### === יצירת חתימה ל-API של עליאקספרס === ###
 def sign_params(params, app_secret):
-    # AliExpress דורש מחרוזת פרמטרים ממוין לפי מפתח, מחוברת יחד, ואז חתומה ב-HMAC-SHA256 עם ה-secret
     param_str = ""
     for key in sorted(params.keys()):
         param_str += f"{key}{params[key]}"
@@ -100,7 +99,13 @@ def make_affiliate_link_aliexpress(product_url, app_key, app_secret):
     params["sign"] = sign_params(params, app_secret)
     api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/portals.open/api.getPromotionLinks/{app_key}'
     resp = requests.get(api_url, params=params)
-    data = resp.json()
+    print("== API raw response (affiliate link) ==", resp.text)
+    try:
+        data = resp.json()
+    except Exception as e:
+        print("שגיאה בפיענוח JSON מה-API:", e)
+        print("תוכן תגובה:", resp.text)
+        return None
     try:
         return data["result"]["promotion_links"][0]['promotion_link']
     except Exception:
@@ -124,7 +129,13 @@ def get_product_details_from_aliexpress(product_id, app_key, app_secret):
     params["sign"] = sign_params(params, app_secret)
     api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/aliexpress.open/api.getProducts/{app_key}'
     resp = requests.get(api_url, params=params)
-    data = resp.json()
+    print("== API raw response (product details) ==", resp.text)
+    try:
+        data = resp.json()
+    except Exception as e:
+        print("שגיאה בפיענוח JSON מה-API:", e)
+        print("תוכן תגובה:", resp.text)
+        return None
     try:
         product = data["result"]["products"][0]
         return {
@@ -152,7 +163,6 @@ def create_post_from_product_data(product_data, affiliate_url, extracted_coupons
     coupon_text = ""
     if extracted_coupons:
         coupon_text = f"\n🎁 קודי קופון: {', '.join(extracted_coupons)}"
-    
     prompt = (
         f"כתוב פוסט דיל בעברית, קצר ומזמין, כאילו חבר ממליץ בקבוצה.\n"
         f"פרטי המוצר:\n"
@@ -163,7 +173,6 @@ def create_post_from_product_data(product_data, affiliate_url, extracted_coupons
         f"{coupon_text}\n"
         f"תן משפט פתיחה, 1-2 אימוג׳ים, נקודות עיקריות, ובסוף כתוב: 'לקנייה, ראו לינק למטה.'"
     )
-    
     response = oa_client.chat.completions.create(
         model=openai_model,
         messages=[
@@ -198,49 +207,39 @@ async def process_channel(channel):
             continue
         if not is_good_post(msg):
             continue
-        
         links = extract_aliexpress_links(msg.message)
         if not links:
             continue
-        
         original_url = links[0]
         product_id = get_product_id(original_url)
-        
         if await already_posted_recently(product_id):
             log_info(f"דיל {product_id} פורסם ב–{REPEAT_COOLDOWN_DAYS} ימים האחרונים, דילוג.")
             continue
-        
         # חילוץ מחיר וקופונים מהטקסט המקורי
         extracted_price = extract_price_from_text(msg.message)
         extracted_coupons = extract_coupons_from_text(msg.message)
-        
         # יצירת לינק שותף
         affiliate_url = make_affiliate_link_aliexpress(original_url, app_key, app_secret)
         if not affiliate_url:
             log_info(f"לא הצליח ליצור קישור שותף ל־{product_id}")
             continue
-        
         # משיכת פרטי מוצר אמיתיים מאליאקספרס
         product_data = get_product_details_from_aliexpress(product_id, app_key, app_secret)
         if not product_data or not product_data.get("image_url"):
             log_info(f"לא הצליח למשוך פרטי מוצר ל־{product_id}")
             continue
-        
         # בניית פוסט חדש
         try:
             new_caption = create_post_from_product_data(product_data, affiliate_url, extracted_coupons)
         except Exception as exc:
             log_info(f"שגיאת OpenAI: {exc}")
             new_caption = f"{product_data['title']}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
-        
         final_text = format_message(new_caption, product_id)
-        
         # הורדת תמונה מאליאקספרס
         image_file = download_image(product_data['image_url'])
         if not image_file:
             log_info(f"לא הצליח להוריד תמונה ל־{product_id}")
             continue
-        
         # פרסום
         try:
             await client.send_file(
