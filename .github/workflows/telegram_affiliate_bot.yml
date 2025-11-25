@@ -15,16 +15,25 @@ jobs:
       TG_SESSION: ${{ secrets.TG_SESSION }}
       TG_SOURCE_CHANNELS: ${{ secrets.TG_SOURCE_CHANNELS }}
       TG_TARGET_CHANNEL: ${{ secrets.TG_TARGET_CHANNEL }}
+      AFFILIATE_API_ENDPOINT: ${{ secrets.AFFILIATE_API_ENDPOINT }}
+      AFFILIATE_API_TOKEN: ${{ secrets.AFFILIATE_API_TOKEN }}
+      AFFILIATE_API_TIMEOUT: ${{ secrets.AFFILIATE_API_TIMEOUT }}
+      AFFILIATE_PORTAL_LINK: ${{ secrets.AFFILIATE_PORTAL_LINK }}
       AFFILIATE_PREFIX: ${{ secrets.AFFILIATE_PREFIX }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-4.1-mini"
-      MIN_VIEWS: "1500"
-      MAX_MESSAGES_PER_CHANNEL: "80"
-      ALIEXPRESS_API_APP_KEY: ${{ secrets.ALIEXPRESS_API_APP_KEY }}
-      ALIEXPRESS_API_APP_SECRET: ${{ secrets.ALIEXPRESS_API_APP_SECRET }}
+      DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
+      MAX_POSTS_PER_RUN: ${{ secrets.MAX_POSTS_PER_RUN || '5' }}
+      MESSAGE_COOLDOWN_SECONDS: ${{ secrets.MESSAGE_COOLDOWN_SECONDS || '5' }}
+      MAX_MESSAGE_AGE_MINUTES: ${{ secrets.MAX_MESSAGE_AGE_MINUTES || '240' }}
+      MAX_MESSAGES_PER_CHANNEL: ${{ secrets.MAX_MESSAGES_PER_CHANNEL || '80' }}
+      MIN_VIEWS: ${{ secrets.MIN_VIEWS || '1500' }}
+      REQUIRE_KEYWORDS: ${{ secrets.REQUIRE_KEYWORDS || 'false' }}
+      KEYWORD_ALLOWLIST: ${{ secrets.KEYWORD_ALLOWLIST }}
+      KEYWORD_BLOCKLIST: ${{ secrets.KEYWORD_BLOCKLIST }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -39,4 +48,4 @@ jobs:
 
       - name: Run bot
         run: |
-          python bot/main.py
+          python -m bot.main

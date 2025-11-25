@@ -1,4 +1,4 @@
-telethon==1.38.1
-requests
+telethon
 openai
 python-dotenv
+httpx

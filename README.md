@@ -1,66 +1,78 @@
 # ALIEXPRESS-BOT-NEW
 
-A Telegram automation that scans source deal channels for AliExpress links, rewrites the copy in Hebrew, swaps in your affiliate link, and posts to your target channel. The workflow is designed to run on GitHub Actions and relies on repository secrets for all credentials.
+אוטומציה מלאה לטלגרם שמאתרת פוסטים עם קישורי AliExpress, ממירה אותם ללינק שותף אישי מהפורטל שלך, כותבת פוסט חדש בעברית בסגנון דילים ישראלי, ומפרסמת לערוץ היעד – או מדווחת במצב DRY_RUN. כל ההרשאות והטוקנים נטענים מ־GitHub Secrets או ממשתני סביבה.
 
-## How it works
-1. Iterates through configured source channels and inspects recent messages.
-2. Filters for posts that look like deals (keywords + optional view threshold) and contain an AliExpress URL.
-3. Builds an affiliate link using your deep-link prefix.
-4. Uses OpenAI to generate fresh Hebrew copy (not a direct copy of the source) and appends a product identifier to avoid duplicates.
-5. Posts the rewritten message to your target channel.
+## מה השתדרג בגרסה הזו?
+- **קבצי קונפיג חדשים לחלוטין** עם חלוקה ברורה ל־API/תבנית/Prefix של לינק שותף.
+- **טעינת קונפיג מחמירה** (בדיקת חסרים, תיאור מצב הפעלה, כישלון מהיר אם אין מקור לינק שותף או רשימת ערוצים).
+- **מחולל לינקים אישי** שמנסה תחילה API מהפורטל, אחר כך תבנית עם `{url}`, לבסוף Prefix – עם נירמול קישורים והסרת קישורי מקור כפולים.
+- **מחולל קופי חדש** לפי הפרומפט שסיכמנו: שאלה פתיחה, פתרון קצר, בולטים תכל'ס, נתוני מחיר/דירוג/הזמנות/קופונים כשיש, ולינק אישי אחד בלבד.
+- **ניקוי קישורים אגרסיבי** – מוחק כל URL שאינו הלינק האישי ומוודא שהוא מופיע פעם אחת בלבד, גם אם המקור או המודל החזירו קישורי s.click מקודדים.
+- **דוחות ריצה**: סיכום לכל ערוץ (נסרק/מועמדים/נשלח/סיבות דילוג) וסיכום כולל. מצב DRY_RUN מדווח אבל לא שולח בפועל.
 
-## Repository layout
-- `bot/main.py` – core bot logic.
-- `requirements.txt` – Python dependencies.
-- `.github/workflows/telegram_affiliate_bot.yml` – scheduled GitHub Actions workflow (runs every 30 minutes by default).
+## מבנה הרפו
+```
+bot/main.py                               # לוגיקת הבוט המלאה
+.github/workflows/telegram_affiliate_bot.yml  # גיטהאב אקשנס מתוזמן
+.env.example                              # תבנית משתני סביבה
+requirements.txt                          # תלות פייתון
+```
 
-## Required secrets
-Set these in **Settings → Secrets and variables → Actions**:
-- `TG_API_ID`
-- `TG_API_HASH`
-- `TG_SESSION` (Telethon StringSession)
-- `TG_SOURCE_CHANNELS` (comma-separated list, e.g., `@source1,@source2`)
-- `TG_TARGET_CHANNEL` (your channel or chat ID)
-- `AFFILIATE_PREFIX` (affiliate deep-link prefix)
-- `OPENAI_API_KEY`
+## משתנים נדרשים (Secrets בגיטהאב)
+הגדר ב־**Settings → Secrets and variables → Actions**:
 
-Optional overrides:
-- `OPENAI_MODEL` (default: `gpt-4.1-mini`)
-- `MIN_VIEWS` (default: `1500`)
-- `MAX_MESSAGES_PER_CHANNEL` (default: `80`)
-- `DRY_RUN` (default: `false`) – when `true`, the bot logs what it would post without sending messages.
+| שם | חובה? | הערה |
+| --- | --- | --- |
+| `TG_API_ID` | כן | מ־my.telegram.org |
+| `TG_API_HASH` | כן | מ־my.telegram.org |
+| `TG_SESSION` | כן | StringSession של החשבון שמריץ את הבוט |
+| `TG_SOURCE_CHANNELS` | כן | רשימת ערוצי מקור מופרדים בפסיק (למשל `@source1,@source2`) |
+| `TG_TARGET_CHANNEL` | כן | הערוץ/קבוצה שלך למשל `@my_channel` |
+| `OPENAI_API_KEY` | כן | מפתח OpenAI |
+| `AFFILIATE_API_ENDPOINT` | אחד מהשלושה | API שמחזיר לינק אישי (מומלץ) |
+| `AFFILIATE_API_TOKEN` | לא | Bearer Token לאותו API |
+| `AFFILIATE_PORTAL_LINK` | אחד מהשלושה | תבנית פורטל עם `{url}` או לינק מוכן מראש |
+| `AFFILIATE_PREFIX` | אחד מהשלושה | Prefix ישן של "prefix + encoded URL" |
+| `AFFILIATE_API_TIMEOUT` | לא | ברירת מחדל 10 שניות |
+| `DRY_RUN` | לא | `true/false` (ברירת מחדל false) |
+| `MAX_POSTS_PER_RUN` | לא | ברירת מחדל 5 |
+| `MESSAGE_COOLDOWN_SECONDS` | לא | ברירת מחדל 5 |
+| `MAX_MESSAGE_AGE_MINUTES` | לא | ברירת מחדל 240 |
+| `MAX_MESSAGES_PER_CHANNEL` | לא | ברירת מחדל 80 |
+| `MIN_VIEWS` | לא | ברירת מחדל 1500 |
+| `REQUIRE_KEYWORDS` | לא | ברירת מחדל false |
+| `KEYWORD_ALLOWLIST` | לא | רשימת מילות מפתח חובה (פסיקים) |
+| `KEYWORD_BLOCKLIST` | לא | רשימת מילות חסימה (פסיקים) |
 
-You can copy `.env.example` to `.env` for local testing and fill in your values.
+> סדר עדיפויות לינק שותף: **API** → **תבנית פורטל** → **Prefix**. אם אף אחד לא קיים – הריצה נכשלת בתחילת הבוט.
 
-## Running locally
+## איך זה עובד
+1. טוען קונפיג ומציג תקציר: מצב DRY_RUN, מס' ערוצי מקור, יעד, מצב לינק שותף, מגבלת פוסטים.
+2. סורק בכל ערוץ עד `MAX_MESSAGES_PER_CHANNEL` הודעות.
+3. בוחר הודעות עם לינק AliExpress ומסנן לפי מילות מפתח/צפיות/גיל הודעה/בלוקליסט.
+4. מפיק לינק שותף אישי מה־API/תבנית/Prefix, ומסיר כל קישור זר.
+5. מחולל טקסט חדש בעברית לפי התבנית שסיכמנו (שאלה פתיחה → פתרון קצר → בולטים → מחיר/דירוג/הזמנות/קופונים אם קיימים → בלוק לינק אישי). אם OpenAI מחזיר ריק – יוצר פוסט דיפולטיבי מינימלי.
+6. מבטיח שהלינק האישי מופיע פעם אחת בדיוק. מוסיף מזהה `(id:<product_id>)` למניעת כפילויות.
+7. שולח לערוץ היעד (או מדווח בלבד ב־DRY_RUN), עם השהייה בין שליחות ומגבלת פוסטים לכל הרצה.
+8. מדפיס סיכום לכל ערוץ ולריצה כולה, כולל ספירת דילוגים לפי סיבה.
+
+## הרצה מקומית
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export TG_API_ID=...
-export TG_API_HASH=...
-export TG_SESSION=...
-export TG_SOURCE_CHANNELS="@source1,@source2"
-export TG_TARGET_CHANNEL=@your_channel
-export AFFILIATE_PREFIX="https://example.com/deeplink?url="
-export OPENAI_API_KEY=...
-export DRY_RUN=true  # optional safety switch while testing locally
-python bot/main.py
+
+# מלא את .env לפי התבנית
+export $(grep -v '^#' .env | xargs)
+
+python -m bot.main
 ```
 
-## Notes
-- The bot only posts a product once per target channel by tagging each message with `(id:<product_id>)`.
-- Adjust the cron schedule in `.github/workflows/telegram_affiliate_bot.yml` if you want a different posting cadence.
-- Keep secrets out of version control; the workflow reads everything from GitHub Secrets.
+## GitHub Actions
+ה־Workflow `.github/workflows/telegram_affiliate_bot.yml` מריץ את הבוט כל 30 דקות או ידנית. כל המשתנים נלקחים מ־Secrets. ניתן לשנות את `cron` לפי הצורך.
 
-## מה עכשיו? (צ'ק־ליסט מהיר)
-1) ודא שכל ה-Secrets קיימים ברפו תחת **Settings → Secrets and variables → Actions** בשמות המדויקים שמופיעים בטבלה למעלה.
-2) אם חסר Secret – הוסף ערך חדש בשם הזהה (למשל `TG_SOURCE_CHANNELS`) והדבק את הערך המתאים.
-3) בלשונית **Actions** בחר את ה-Workflow "Telegram Affiliate Bot" והפעל **Run workflow** פעם אחת כדי לראות שהכול תקין בלוגים.
-4) מרגע שהריצה הראשונה הצליחה, ה-Workflow יפעל אוטומטית כל 30 דקות (לפי ה-cron). אפשר לשנות את התזמון בקובץ ה-YAML אם תרצה.
-5) לבדיקת ביצועים או הדגמה מקומית, הרץ את הפקודות שבחלק "Running locally" (עם אותם משתני סביבה).
-
-אם משהו נתקע או אין פוסטים בקבוצת היעד:
-- ודא שהקבוצות במשתנה `TG_SOURCE_CHANNELS` פומביות או שהחשבון שמייצר את ה-`TG_SESSION` חבר בהן.
-- הגדל זמנית את `MAX_MESSAGES_PER_CHANNEL` או הקטן את `MIN_VIEWS` כדי לתפוס יותר פוסטים בבדיקה.
-- בדוק ביומן הריצה ב-GitHub Actions את ההדפסות (log) שמגיעות מהבוט.
+## טיפים לאבחון
+- ריצת DRY_RUN תראה בלוגים מה היה נשלח אבל לא תפרסם כלום.
+- אם "posted" נשאר 0: בדוק בלוג סיכום דילוגים (חוסר מילות מפתח, צפיות נמוכות, הודעה ישנה, כפילויות). אפשר להוריד `MIN_VIEWS`, לבטל `REQUIRE_KEYWORDS`, או להגדיל `MAX_MESSAGES_PER_CHANNEL` זמנית.
+- ודא שהחשבון שב־`TG_SESSION` חבר בכל ערוצי המקור.
+- אם הלינק האישי לא מופיע: ודא ש־API/תבנית/Prefix מוגדרים ושאינם ריקים/רווחים בלבד.
