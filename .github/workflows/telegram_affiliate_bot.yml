@@ -15,17 +15,11 @@ jobs:
       TG_SESSION: ${{ secrets.TG_SESSION }}
       TG_SOURCE_CHANNELS: ${{ secrets.TG_SOURCE_CHANNELS }}
       TG_TARGET_CHANNEL: ${{ secrets.TG_TARGET_CHANNEL }}
-      AFFILIATE_PORTAL_LINK: ${{ secrets.AFFILIATE_PORTAL_LINK || '' }}
       AFFILIATE_PREFIX: ${{ secrets.AFFILIATE_PREFIX }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-4.1-mini"
       MIN_VIEWS: "1500"
       MAX_MESSAGES_PER_CHANNEL: "80"
-      MAX_POSTS_PER_RUN: "5"
-      MESSAGE_COOLDOWN_SECONDS: "5"
-      MAX_MESSAGE_AGE_MINUTES: "240"
-      KEYWORD_ALLOWLIST: ${{ secrets.KEYWORD_ALLOWLIST || '' }}
-      KEYWORD_BLOCKLIST: ${{ secrets.KEYWORD_BLOCKLIST || '' }}
 
     steps:
       - name: Checkout repository
