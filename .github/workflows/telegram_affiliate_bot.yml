@@ -20,6 +20,8 @@ jobs:
       OPENAI_MODEL: "gpt-4.1-mini"
       MIN_VIEWS: "1500"
       MAX_MESSAGES_PER_CHANNEL: "80"
+      ALIEXPRESS_API_APP_KEY: ${{ secrets.ALIEXPRESS_API_APP_KEY }}
+      ALIEXPRESS_API_APP_SECRET: ${{ secrets.ALIEXPRESS_API_APP_SECRET }}
 
     steps:
       - name: Checkout repository
