@@ -10,6 +10,9 @@ from openai import OpenAI
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.custom.message import Message
+import hashlib
+import hmac
+import time
 
 ### הגדרות סביבה ###
 def _must_get_env(name: str) -> str:
@@ -27,8 +30,8 @@ openai_api_key = _must_get_env("OPENAI_API_KEY")
 openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 min_views = int(os.getenv("MIN_VIEWS", "1500"))
 max_messages_per_channel = int(os.getenv("MAX_MESSAGES_PER_CHANNEL", "80"))
-access_token = _must_get_env("ALIEXPRESS_API_ACCESS_TOKEN")
 app_key = _must_get_env("ALIEXPRESS_API_APP_KEY")
+app_secret = _must_get_env("ALIEXPRESS_API_APP_SECRET")
 REPEAT_COOLDOWN_DAYS = int(os.getenv("REPEAT_COOLDOWN_DAYS", "3"))
 
 client = TelegramClient(StringSession(tg_session), tg_api_id, tg_api_hash)
@@ -49,14 +52,12 @@ def get_product_id(url):
     return url.split("?")[0]
 
 def extract_price_from_text(text):
-    # מחפש מחיר בפורמט: 123₪ או $45 או 67 ש"ח
     price_match = re.search(r'(\d+[\.,]?\d*)\s*[₪$]|(\d+[\.,]?\d*)\s*ש"ח', text)
     if price_match:
         return price_match.group(1) or price_match.group(2)
     return None
 
 def extract_coupons_from_text(text):
-    # מחפש קודי קופון (לדוג': SAVE20, BF2024 וכו')
     coupon_matches = re.findall(r'[A-Z0-9]{4,15}', text)
     return coupon_matches[:3] if coupon_matches else []
 
@@ -73,14 +74,31 @@ async def already_posted_recently(product_id: str) -> bool:
                 return True
     return False
 
+### === יצירת חתימה ל-API של עליאקספרס === ###
+def sign_params(params, app_secret):
+    # AliExpress דורש מחרוזת פרמטרים ממוין לפי מפתח, מחוברת יחד, ואז חתומה ב-HMAC-SHA256 עם ה-secret
+    param_str = ""
+    for key in sorted(params.keys()):
+        param_str += f"{key}{params[key]}"
+    sign_str = app_secret + param_str + app_secret
+    sign = hashlib.md5(sign_str.encode('utf-8')).hexdigest().upper()
+    return sign
+
 ### === יצירת לינק שותף === ###
-def make_affiliate_link_aliexpress(product_url, access_token, app_key):
-    api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/portals.open/api.getPromotionLinks/{app_key}'
+def make_affiliate_link_aliexpress(product_url, app_key, app_secret):
+    api_method = "portals.open/api.getPromotionLinks"
+    timestamp = str(int(time.time() * 1000))
     params = {
-        "access_token": access_token,
+        "app_key": app_key,
+        "timestamp": timestamp,
+        "sign_method": "md5",
         "promotion_link_type": "1",
-        "urls": product_url
+        "urls": product_url,
+        "format": "json",
+        "v": "2.0"
     }
+    params["sign"] = sign_params(params, app_secret)
+    api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/portals.open/api.getPromotionLinks/{app_key}'
     resp = requests.get(api_url, params=params)
     data = resp.json()
     try:
@@ -90,14 +108,21 @@ def make_affiliate_link_aliexpress(product_url, access_token, app_key):
         return None
 
 ### === משיכת פרטי מוצר + תמונה מאליאקספרס === ###
-def get_product_details_from_aliexpress(product_id, access_token, app_key):
-    api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/aliexpress.open/api.getProducts/{app_key}'
+def get_product_details_from_aliexpress(product_id, app_key, app_secret):
+    api_method = "aliexpress.open/api.getProducts"
+    timestamp = str(int(time.time() * 1000))
     params = {
-        "access_token": access_token,
+        "app_key": app_key,
+        "timestamp": timestamp,
+        "sign_method": "md5",
         "product_ids": product_id,
         "target_currency": "ILS",
-        "target_language": "HE"
+        "target_language": "HE",
+        "format": "json",
+        "v": "2.0"
     }
+    params["sign"] = sign_params(params, app_secret)
+    api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/aliexpress.open/api.getProducts/{app_key}'
     resp = requests.get(api_url, params=params)
     data = resp.json()
     try:
@@ -190,13 +215,13 @@ async def process_channel(channel):
         extracted_coupons = extract_coupons_from_text(msg.message)
         
         # יצירת לינק שותף
-        affiliate_url = make_affiliate_link_aliexpress(original_url, access_token, app_key)
+        affiliate_url = make_affiliate_link_aliexpress(original_url, app_key, app_secret)
         if not affiliate_url:
             log_info(f"לא הצליח ליצור קישור שותף ל־{product_id}")
             continue
         
         # משיכת פרטי מוצר אמיתיים מאליאקספרס
-        product_data = get_product_details_from_aliexpress(product_id, access_token, app_key)
+        product_data = get_product_details_from_aliexpress(product_id, app_key, app_secret)
         if not product_data or not product_data.get("image_url"):
             log_info(f"לא הצליח למשוך פרטי מוצר ל־{product_id}")
             continue
