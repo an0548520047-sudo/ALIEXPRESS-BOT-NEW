@@ -49,7 +49,6 @@ REPEAT_COOLDOWN_DAYS = int(os.getenv("REPEAT_COOLDOWN_DAYS", "3"))
 client = TelegramClient(StringSession(tg_session), tg_api_id, tg_api_hash)
 oa_client = OpenAI(api_key=openai_api_key)
 
-# ==== REGEX ====
 ali_regex = re.compile(r"https?://[^\s]*aliexpress\.com[^\s]*", re.IGNORECASE)
 
 def extract_links(text):
@@ -70,6 +69,10 @@ def make_affiliate_link(url):
 def format_message(content, product_id):
     return f"{content}\n\n(id:{product_id})"
 
+# פונקציה שמנקה את כל קישורי אליאקספרס מהטקסט
+def clean_orig_text(text):
+    return re.sub(r'https?://[^\s]*aliexpress\.com[^\s]*', '', text).strip()
+
 async def already_posted_recently(product_id: str) -> bool:
     async for msg in client.iter_messages(tg_target_channel, limit=400):
         if not msg.message or f"(id:{product_id})" not in msg.message:
@@ -81,24 +84,27 @@ async def already_posted_recently(product_id: str) -> bool:
     return False
 
 def rewrite_caption(orig_text, affiliate_url):
+    clean_text = clean_orig_text(orig_text)
     prompt = (
-        "כתוב פוסט דיל קצר בעברית ממליץ, כאילו חבר אמיתי משתף בקבוצת ווטסאפ/טלגרם. "
-        "אסור להמציא שום מידע, אין להוסיף נתונים חדשים! תתייחס אך ורק לפרטים שמופיעים בטקסט של הדיל המקורי. "
-        "תוכל לנסח מחדש, להוסיף טון חברי וישראלי, 1-2 אימוג׳ים בלבד, אבל חובתך לכתוב רק מה שכתוב בטקסט המקורי. "
-        f"בסוף הפוסט כתוב תמיד:\n👇 לקנייה באליאקספרס:\n{affiliate_url}\n"
-        "הנה הדיל המקורי (המידע היחיד שמותר להשתמש בו):\n"
-        f"{orig_text}"
+        "כתוב פוסט דיל בעברית: תן המלצה קלילה ומזמינה שמתאימה לקבוצה, לא לפרסום מסחרי. "
+        "הפוסט חייב להיות קצר וקריא, עם טון חברי, שורת פתיחה, 1–2 אימוג'ים, ותכל'ס הנקודות הכי ברורות על המוצר. "
+        "אל תכניס קישור בפוסט. בסוף תכתוב במשפט: 'לקנייה, ראו את הלינק כאן למטה'. "
+        "אסור להמציא מידע שלא הופיע — עשה שימוש מדויק רק בפרטים שמופיעים למעלה, אין להוסיף נתונים/מבצעים/מחירים שלא הוזכרו. "
+        "הנה פרטי הדיל להשראה בלבד:\n"
+        f"{clean_text}"
     )
     response = oa_client.chat.completions.create(
         model=openai_model,
         messages=[
-            {"role": "system", "content": "אל תמציא או תוסיף מידע – חובה להשתמש רק במה שמופיע בטקסט הדיל המקורי!"},
+            {"role": "system", "content": "אל תכניס לינק בפוסט. כתוב בעברית, קצר, קליל, ועם המלצה ברורה בלבד."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.6,
-        max_tokens=390,
+        temperature=0.65,
+        max_tokens=380,
     )
-    return response.choices[0].message.content.strip()
+    # ופה תמיד בצמוד, תלביש את הלינק השותף שלך
+    final_post = response.choices[0].message.content.strip() + f"\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
+    return final_post
 
 def log_info(msg): print(msg, flush=True)
 
@@ -135,7 +141,7 @@ async def process_channel(channel):
             new_caption = rewrite_caption(msg.message, affiliate_url)
         except Exception as exc:
             log_info(f"שגיאת OpenAI: {exc}")
-            new_caption = f"{msg.message}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
+            new_caption = clean_orig_text(msg.message) + f"\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
         final_text = format_message(new_caption, product_id)
         if dry_run:
             log_info(f"(DRY_RUN) היה נשלח {product_id} לערוץ היעד")
