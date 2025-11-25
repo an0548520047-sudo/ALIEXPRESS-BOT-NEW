@@ -41,13 +41,13 @@ def _list_env(name: str) -> List[str]:
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
 
 
-def _int_env(name: str, default: int) -> int:
+def _int_env(name: str, default: int, *, allow_zero: bool = False, min_value: int | None = None) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return default
 
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         print(
             f"Warning: {name} must be an integer; got {raw!r}. "
@@ -56,14 +56,38 @@ def _int_env(name: str, default: int) -> int:
         )
         return default
 
+    if min_value is not None and value < min_value:
+        print(
+            f"Warning: {name} must be >= {min_value}; got {value!r}. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
 
-def _float_env(name: str, default: float) -> float:
+    if value == 0 and not allow_zero:
+        print(
+            f"Warning: {name} must be positive; got 0. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    return value
+
+
+def _float_env(
+    name: str,
+    default: float,
+    *,
+    allow_zero: bool = False,
+    min_value: float | None = None,
+) -> float:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return default
 
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         print(
             f"Warning: {name} must be a number; got {raw!r}. "
@@ -71,6 +95,24 @@ def _float_env(name: str, default: float) -> float:
             flush=True,
         )
         return default
+
+    if min_value is not None and value < min_value:
+        print(
+            f"Warning: {name} must be >= {min_value}; got {value!r}. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    if value == 0 and not allow_zero:
+        print(
+            f"Warning: {name} must be positive; got 0. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    return value
 
 
 @dataclass
@@ -121,18 +163,20 @@ class Config:
             tg_target_channel=_require_env("TG_TARGET_CHANNEL"),
             affiliate_api_endpoint=affiliate_api_endpoint,
             affiliate_api_token=(os.getenv("AFFILIATE_API_TOKEN") or "").strip() or None,
-            affiliate_api_timeout=_float_env("AFFILIATE_API_TIMEOUT", 5.0),
+            affiliate_api_timeout=_float_env("AFFILIATE_API_TIMEOUT", 5.0, min_value=1e-6),
             affiliate_portal_template=affiliate_portal_template,
             affiliate_prefix=affiliate_prefix,
             openai_api_key=_require_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            min_views=_int_env("MIN_VIEWS", 1500),
-            max_messages_per_channel=_int_env("MAX_MESSAGES_PER_CHANNEL", 80),
+            min_views=_int_env("MIN_VIEWS", 1500, allow_zero=True, min_value=0),
+            max_messages_per_channel=_int_env("MAX_MESSAGES_PER_CHANNEL", 80, min_value=1),
             dry_run=_bool_env("DRY_RUN", False),
             require_keywords=_bool_env("REQUIRE_KEYWORDS", False),
-            max_posts_per_run=_int_env("MAX_POSTS_PER_RUN", 5),
-            message_cooldown_seconds=_float_env("MESSAGE_COOLDOWN_SECONDS", 5.0),
-            max_message_age_minutes=_int_env("MAX_MESSAGE_AGE_MINUTES", 240),
+            max_posts_per_run=_int_env("MAX_POSTS_PER_RUN", 5, min_value=1),
+            message_cooldown_seconds=_float_env(
+                "MESSAGE_COOLDOWN_SECONDS", 5.0, allow_zero=True, min_value=0.0
+            ),
+            max_message_age_minutes=_int_env("MAX_MESSAGE_AGE_MINUTES", 240, min_value=1),
             keyword_allowlist=_list_env("KEYWORD_ALLOWLIST"),
             keyword_blocklist=_list_env("KEYWORD_BLOCKLIST"),
         )
@@ -284,14 +328,17 @@ class AffiliateLinkBuilder:
 
         api_link = self._from_api(cleaned)
         if api_link:
+            log_info(f"Using affiliate link from API (ending: {api_link[-8:]})")
             return api_link
 
         portal_link = self._from_portal_template(encoded)
         if portal_link:
+            log_info(f"Using affiliate link from portal template (ending: {portal_link[-8:]})")
             return portal_link
 
         prefix_link = self._from_prefix(encoded)
         if prefix_link:
+            log_info(f"Using affiliate link from prefix (ending: {prefix_link[-8:]})")
             return prefix_link
 
         raise RuntimeError("Failed to build affiliate link; check your configuration")
