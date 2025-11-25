@@ -85,6 +85,7 @@ def sign_params(params, app_secret):
 
 ### === יצירת לינק שותף === ###
 def make_affiliate_link_aliexpress(product_url, app_key, app_secret):
+    tracking_id = "abualiexpress"  # Tracking ID שלך (לקוח מהממשק של AliExpress)
     api_method = "portals.open/api.getPromotionLinks"
     timestamp = str(int(time.time() * 1000))
     params = {
@@ -94,23 +95,25 @@ def make_affiliate_link_aliexpress(product_url, app_key, app_secret):
         "promotion_link_type": "1",
         "urls": product_url,
         "format": "json",
-        "v": "2.0"
+        "v": "2.0",
+        "tracking_id": tracking_id
     }
     params["sign"] = sign_params(params, app_secret)
     api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/portals.open/api.getPromotionLinks/{app_key}'
+    print(f"== שולח בקשה עם tracking_id: {tracking_id} ==")
     resp = requests.post(api_url, data=params)
     print("== API status code:", resp.status_code)
     print("== API raw response (affiliate link) ==", resp.text)
     try:
         data = resp.json()
+        if "result" in data and "promotion_links" in data["result"]:
+            return data["result"]["promotion_links"][0]['promotion_link']
+        else:
+            print("ה־API החזיר תשובה אך בלי לינק:", data)
+            return None
     except Exception as e:
         print("שגיאה בפיענוח JSON מה-API:", e)
         print("תוכן תגובה:", resp.text)
-        return None
-    try:
-        return data["result"]["promotion_links"][0]['promotion_link']
-    except Exception:
-        print("ה־API לא החזיר קישור נכון:", data)
         return None
 
 ### === משיכת פרטי מוצר + תמונה מאליאקספרס === ###
