@@ -98,7 +98,8 @@ def make_affiliate_link_aliexpress(product_url, app_key, app_secret):
     }
     params["sign"] = sign_params(params, app_secret)
     api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/portals.open/api.getPromotionLinks/{app_key}'
-    resp = requests.get(api_url, params=params)
+    resp = requests.post(api_url, data=params)
+    print("== API status code:", resp.status_code)
     print("== API raw response (affiliate link) ==", resp.text)
     try:
         data = resp.json()
@@ -128,7 +129,8 @@ def get_product_details_from_aliexpress(product_id, app_key, app_secret):
     }
     params["sign"] = sign_params(params, app_secret)
     api_url = f'https://gw-api.aliexpress.com/openapi/param2/2/aliexpress.open/api.getProducts/{app_key}'
-    resp = requests.get(api_url, params=params)
+    resp = requests.post(api_url, data=params)
+    print("== API status code:", resp.status_code)
     print("== API raw response (product details) ==", resp.text)
     try:
         data = resp.json()
@@ -215,32 +217,26 @@ async def process_channel(channel):
         if await already_posted_recently(product_id):
             log_info(f"דיל {product_id} פורסם ב–{REPEAT_COOLDOWN_DAYS} ימים האחרונים, דילוג.")
             continue
-        # חילוץ מחיר וקופונים מהטקסט המקורי
         extracted_price = extract_price_from_text(msg.message)
         extracted_coupons = extract_coupons_from_text(msg.message)
-        # יצירת לינק שותף
         affiliate_url = make_affiliate_link_aliexpress(original_url, app_key, app_secret)
         if not affiliate_url:
             log_info(f"לא הצליח ליצור קישור שותף ל־{product_id}")
             continue
-        # משיכת פרטי מוצר אמיתיים מאליאקספרס
         product_data = get_product_details_from_aliexpress(product_id, app_key, app_secret)
         if not product_data or not product_data.get("image_url"):
             log_info(f"לא הצליח למשוך פרטי מוצר ל־{product_id}")
             continue
-        # בניית פוסט חדש
         try:
             new_caption = create_post_from_product_data(product_data, affiliate_url, extracted_coupons)
         except Exception as exc:
             log_info(f"שגיאת OpenAI: {exc}")
             new_caption = f"{product_data['title']}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
         final_text = format_message(new_caption, product_id)
-        # הורדת תמונה מאליאקספרס
         image_file = download_image(product_data['image_url'])
         if not image_file:
             log_info(f"לא הצליח להוריד תמונה ל־{product_id}")
             continue
-        # פרסום
         try:
             await client.send_file(
                 tg_target_channel,
