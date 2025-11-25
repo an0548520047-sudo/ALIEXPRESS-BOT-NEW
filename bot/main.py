@@ -1,4 +1,3 @@
-import broker
 import telethon
 import sys
 import os
