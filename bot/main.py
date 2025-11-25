@@ -1,3 +1,4 @@
+import broker
 import telethon
 import sys
 import os
@@ -9,16 +10,6 @@ from openai import OpenAI
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.custom.message import Message
-
-# ==== DEBUG ====
-tg_session = os.environ.get("TG_SESSION", "")
-print("\n==== DEBUG TELETHON ====")
-print("Telethon version:", telethon.__version__)
-print("Python version:", sys.version)
-print("TG_SESSION length:", len(tg_session))
-print("First 10:", tg_session[:10])
-print("Last 10:", tg_session[-10:])
-print("========================\n")
 
 # ==== ENV ====
 def _must_get_env(name: str) -> str:
@@ -49,7 +40,8 @@ REPEAT_COOLDOWN_DAYS = int(os.getenv("REPEAT_COOLDOWN_DAYS", "3"))
 client = TelegramClient(StringSession(tg_session), tg_api_id, tg_api_hash)
 oa_client = OpenAI(api_key=openai_api_key)
 
-ali_regex = re.compile(r"https?://[^\s]*aliexpress\.com[^\s]*", re.IGNORECASE)
+# ==== עזרים ====
+ali_regex = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 def extract_links(text):
     return ali_regex.findall(text) if text else []
@@ -69,9 +61,9 @@ def make_affiliate_link(url):
 def format_message(content, product_id):
     return f"{content}\n\n(id:{product_id})"
 
-# פונקציה שמנקה את כל קישורי אליאקספרס מהטקסט
 def clean_orig_text(text):
-    return re.sub(r'https?://[^\s]*aliexpress\.com[^\s]*', '', text).strip()
+    # מוחק כל לינק מהטקסט כדי שלא יישארו בכלל קישורים מקוריים
+    return re.sub(r'https?://[^\s]+', '', text).strip()
 
 async def already_posted_recently(product_id: str) -> bool:
     async for msg in client.iter_messages(tg_target_channel, limit=400):
@@ -86,25 +78,22 @@ async def already_posted_recently(product_id: str) -> bool:
 def rewrite_caption(orig_text, affiliate_url):
     clean_text = clean_orig_text(orig_text)
     prompt = (
-        "כתוב פוסט דיל בעברית: תן המלצה קלילה ומזמינה שמתאימה לקבוצה, לא לפרסום מסחרי. "
-        "הפוסט חייב להיות קצר וקריא, עם טון חברי, שורת פתיחה, 1–2 אימוג'ים, ותכל'ס הנקודות הכי ברורות על המוצר. "
-        "אל תכניס קישור בפוסט. בסוף תכתוב במשפט: 'לקנייה, ראו את הלינק כאן למטה'. "
-        "אסור להמציא מידע שלא הופיע — עשה שימוש מדויק רק בפרטים שמופיעים למעלה, אין להוסיף נתונים/מבצעים/מחירים שלא הוזכרו. "
-        "הנה פרטי הדיל להשראה בלבד:\n"
-        f"{clean_text}"
+        "כתוב פוסט דיל בעברית, בגובה העיניים, קצר ושימושי – כאילו אתה ממליץ לחבר קבוצה. "
+        "אסור להכניס קישור בשום מקום בפוסט! תן משפט פתיחה, 1–2 אימוג'ים, ונקודות עיקריות כגון מחיר/דירוג/הזמנות רק אם מופיעים בטקסט. "
+        "בסיום הפוסט כתוב 'לקנייה, ראו את הלינק כאן למטה.' אין להמציא מידע!"
+        f"\nהנה המידע על הדיל:\n{clean_text}"
     )
     response = oa_client.chat.completions.create(
         model=openai_model,
         messages=[
-            {"role": "system", "content": "אל תכניס לינק בפוסט. כתוב בעברית, קצר, קליל, ועם המלצה ברורה בלבד."},
+            {"role": "system", "content": "לא להוסיף לינקים בפוסט בכלל! ולא להמציא מידע. הכל בעברית בלבד."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.65,
-        max_tokens=380,
+        max_tokens=380
     )
-    # ופה תמיד בצמוד, תלביש את הלינק השותף שלך
-    final_post = response.choices[0].message.content.strip() + f"\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
-    return final_post
+    # מוסיף תמיד את הלינק שלך, ולעולם לא לינק שונה מהשורה הזאת!
+    return response.choices[0].message.content.strip() + f"\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
 
 def log_info(msg): print(msg, flush=True)
 
@@ -132,11 +121,11 @@ async def process_channel(channel):
         if not links:
             continue
         original_url = links[0]
+        affiliate_url = make_affiliate_link(original_url)
         product_id = get_product_id(original_url)
         if await already_posted_recently(product_id):
             log_info(f"דיל {product_id} פורסם ב–{REPEAT_COOLDOWN_DAYS} ימים האחרונים, דילוג.")
             continue
-        affiliate_url = make_affiliate_link(original_url)
         try:
             new_caption = rewrite_caption(msg.message, affiliate_url)
         except Exception as exc:
