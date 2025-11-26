@@ -41,6 +41,14 @@ def _list_env(name: str) -> List[str]:
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
 
 
+def _optional_str(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    return cleaned or None
+
+
 def _int_env(name: str, default: int, *, allow_zero: bool = False, min_value: int | None = None) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -138,6 +146,8 @@ class Config:
     max_message_age_minutes: int
     keyword_allowlist: List[str]
     keyword_blocklist: List[str]
+    resolve_redirects: bool
+    resolve_redirect_timeout: float
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -145,9 +155,9 @@ class Config:
         if not tg_source_channels:
             raise RuntimeError("TG_SOURCE_CHANNELS is set but empty after parsing")
 
-        affiliate_api_endpoint = (os.getenv("AFFILIATE_API_ENDPOINT") or "").strip() or None
-        affiliate_portal_template = (os.getenv("AFFILIATE_PORTAL_LINK") or "").strip() or None
-        affiliate_prefix = (os.getenv("AFFILIATE_PREFIX") or "").strip() or None
+        affiliate_api_endpoint = _optional_str("AFFILIATE_API_ENDPOINT")
+        affiliate_portal_template = _optional_str("AFFILIATE_PORTAL_LINK")
+        affiliate_prefix = _optional_str("AFFILIATE_PREFIX")
 
         if not (affiliate_api_endpoint or affiliate_portal_template or affiliate_prefix):
             raise RuntimeError(
@@ -179,6 +189,8 @@ class Config:
             max_message_age_minutes=_int_env("MAX_MESSAGE_AGE_MINUTES", 240, min_value=1),
             keyword_allowlist=_list_env("KEYWORD_ALLOWLIST"),
             keyword_blocklist=_list_env("KEYWORD_BLOCKLIST"),
+            resolve_redirects=_bool_env("RESOLVE_REDIRECTS", True),
+            resolve_redirect_timeout=_float_env("RESOLVE_REDIRECT_TIMEOUT", 4.0, min_value=0.1),
         )
 
     def describe_affiliate_mode(self) -> str:
@@ -198,6 +210,32 @@ class Config:
 
 def _canonical_url(url: str) -> str:
     return url.strip().strip("[]()<>.,")
+
+
+def resolve_final_url(url: str, *, enabled: bool, timeout_seconds: float) -> str:
+    """Follow redirects for AliExpress short links to capture the real product URL.
+
+    When disabled or failing, returns the original URL so the run can proceed.
+    """
+    if not enabled:
+        return url
+
+    normalized = _canonical_url(url)
+    if "s.click.aliexpress.com" not in normalized.lower():
+        return normalized
+
+    try:
+        timeout = httpx.Timeout(timeout_seconds, connect=timeout_seconds, read=timeout_seconds, write=timeout_seconds)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            response = client.get(normalized)
+        if response.history and response.url:
+            final_url = str(response.url)
+            log_info(f"Resolved short link to final URL (ending: {final_url[-12:]})")
+            return final_url
+    except Exception as exc:  # noqa: BLE001
+        log_info(f"Redirect resolution failed; using original URL: {exc}")
+
+    return normalized
 
 
 def _strip_urls_with_affiliate(content: str, affiliate_url: str, append_if_missing: bool) -> Tuple[str, bool]:
@@ -606,7 +644,15 @@ class DealBot:
                 continue
 
             original_url = links[0]
-            product_id = normalize_aliexpress_id(original_url)
+            resolved_url = resolve_final_url(
+                original_url,
+                enabled=self.config.resolve_redirects,
+                timeout_seconds=self.config.resolve_redirect_timeout,
+            )
+            if resolved_url != _canonical_url(original_url):
+                log_info("Expanded short link to capture the real product URL before affiliation")
+
+            product_id = normalize_aliexpress_id(resolved_url)
             eligible_candidates += 1
 
             if product_id in self.processed_product_ids:
@@ -620,7 +666,7 @@ class DealBot:
                 _mark_skip("duplicate previously posted")
                 continue
 
-            affiliate_url = self.affiliate_builder.build(original_url)
+            affiliate_url = self.affiliate_builder.build(resolved_url)
 
             source_without_links = strip_non_affiliate_links(msg.message, affiliate_url)
             if source_without_links != msg.message:

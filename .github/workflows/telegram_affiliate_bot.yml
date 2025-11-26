@@ -20,6 +20,8 @@ jobs:
       AFFILIATE_API_TIMEOUT: ${{ secrets.AFFILIATE_API_TIMEOUT }}
       AFFILIATE_PORTAL_LINK: ${{ secrets.AFFILIATE_PORTAL_LINK }}
       AFFILIATE_PREFIX: ${{ secrets.AFFILIATE_PREFIX }}
+      RESOLVE_REDIRECTS: ${{ secrets.RESOLVE_REDIRECTS || 'true' }}
+      RESOLVE_REDIRECT_TIMEOUT: ${{ secrets.RESOLVE_REDIRECT_TIMEOUT || '4' }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-4.1-mini"
       DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
