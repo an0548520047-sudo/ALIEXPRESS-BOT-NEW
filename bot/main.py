@@ -148,6 +148,9 @@ class Config:
     keyword_blocklist: List[str]
     resolve_redirects: bool
     resolve_redirect_timeout: float
+    affiliate_shortener_endpoint: str | None
+    affiliate_shortener_token: str | None
+    affiliate_shortener_timeout: float
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -191,6 +194,9 @@ class Config:
             keyword_blocklist=_list_env("KEYWORD_BLOCKLIST"),
             resolve_redirects=_bool_env("RESOLVE_REDIRECTS", True),
             resolve_redirect_timeout=_float_env("RESOLVE_REDIRECT_TIMEOUT", 4.0, min_value=0.1),
+            affiliate_shortener_endpoint=_optional_str("AFFILIATE_SHORTENER_ENDPOINT"),
+            affiliate_shortener_token=_optional_str("AFFILIATE_SHORTENER_TOKEN"),
+            affiliate_shortener_timeout=_float_env("AFFILIATE_SHORTENER_TIMEOUT", 4.0, min_value=0.5),
         )
 
     def describe_affiliate_mode(self) -> str:
@@ -236,6 +242,29 @@ def resolve_final_url(url: str, *, enabled: bool, timeout_seconds: float) -> str
         log_info(f"Redirect resolution failed; using original URL: {exc}")
 
     return normalized
+
+
+def canonical_product_url(url: str) -> str:
+    """Return a clean product URL so affiliate builders don't double-wrap tracking links.
+
+    This strips URL encoding and normalizes to a direct `/item/<id>.html` link when we can
+    extract an item id. If we cannot find an item id, the cleaned canonical URL is returned
+    so we still make progress.
+    """
+
+    decoded = _canonical_url(unquote(url))
+
+    id_match = re.search(r"/item/(\d+)\.html", decoded)
+    if id_match:
+        item_id = id_match.group(1)
+        return f"https://www.aliexpress.com/item/{item_id}.html"
+
+    loose_match = re.search(r"/(\d{7,})\.html", decoded)
+    if loose_match:
+        item_id = loose_match.group(1)
+        return f"https://www.aliexpress.com/item/{item_id}.html"
+
+    return decoded
 
 
 def _strip_urls_with_affiliate(content: str, affiliate_url: str, append_if_missing: bool) -> Tuple[str, bool]:
@@ -295,6 +324,7 @@ def enforce_single_affiliate_link(content: str, affiliate_url: str) -> str:
 class AffiliateLinkBuilder:
     def __init__(self, config: Config):
         self.config = config
+        self._shortener_enabled = bool(self.config.affiliate_shortener_endpoint)
 
     def _from_api(self, original_url: str) -> str | None:
         if not self.config.affiliate_api_endpoint:
@@ -360,26 +390,123 @@ class AffiliateLinkBuilder:
             return None
         return f"{self.config.affiliate_prefix}{encoded_url}"
 
-    def build(self, original_url: str) -> str:
-        cleaned = _canonical_url(unquote(original_url))
+    def _shorten(self, affiliate_url: str) -> str | None:
+        if not self._shortener_enabled:
+            return None
+
+        headers = {"Content-Type": "application/json"}
+        if self.config.affiliate_shortener_token:
+            headers["Authorization"] = f"Bearer {self.config.affiliate_shortener_token}"
+
+        payload = {"url": affiliate_url}
+        try:
+            timeout = httpx.Timeout(
+                self.config.affiliate_shortener_timeout,
+                connect=self.config.affiliate_shortener_timeout,
+                read=self.config.affiliate_shortener_timeout,
+                write=self.config.affiliate_shortener_timeout,
+            )
+            log_info(
+                "Calling affiliate shortener with timeout="
+                f"{self.config.affiliate_shortener_timeout}s"
+            )
+            with httpx.Client(timeout=timeout) as http_client:
+                response = http_client.post(
+                    self.config.affiliate_shortener_endpoint,
+                    json=payload,
+                    headers=headers,
+                )
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            log_info(f"Shortener call failed; using full affiliate link: {exc}")
+            return None
+
+        try:
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            log_info(f"Could not parse shortener JSON response: {exc}")
+            return None
+
+        candidates = [
+            data.get("short_link") if isinstance(data, dict) else None,
+            data.get("data", {}).get("short_link") if isinstance(data, dict) else None,
+            data.get("result", {}).get("short_link") if isinstance(data, dict) else None,
+            data.get("shortUrl") if isinstance(data, dict) else None,
+        ]
+
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                short = _canonical_url(candidate)
+                log_info(f"Using shortened affiliate link (ending: {short[-8:]})")
+                return short
+
+        log_info("Shortener response missing link fields; keeping original affiliate link")
+        return None
+
+    def _link_matches_product(self, link: str, *, product_id: str | None, product_url: str) -> bool:
+        """Return True when the link clearly references the target product."""
+
+        canonical_product = canonical_product_url(product_url)
+        unquoted_link = unquote(link)
+
+        if product_id and product_id in unquoted_link:
+            return True
+
+        if canonical_product in unquoted_link:
+            return True
+
+        return False
+
+    def build(self, product_url: str, *, product_id: str | None = None) -> str:
+        """Build an affiliate link and ensure it targets the actual product.
+
+        We try the portal API first, then the portal template, then the legacy prefix.
+        Any candidate that does not reference the expected product id/url is ignored in
+        favor of a deterministic portal-template/prefix build so we don't land on generic
+        pages or double-wrapped trackers.
+        """
+
+        cleaned = canonical_product_url(product_url)
         encoded = quote(cleaned, safe="")
 
-        api_link = self._from_api(cleaned)
-        if api_link:
-            log_info(f"Using affiliate link from API (ending: {api_link[-8:]})")
-            return api_link
+        candidates: List[Tuple[str | None, str]] = [
+            (self._from_api(cleaned), "API"),
+            (self._from_portal_template(encoded), "portal template"),
+            (self._from_prefix(encoded), "prefix"),
+        ]
 
-        portal_link = self._from_portal_template(encoded)
-        if portal_link:
-            log_info(f"Using affiliate link from portal template (ending: {portal_link[-8:]})")
-            return portal_link
+        for candidate, source in candidates:
+            if not candidate:
+                continue
 
-        prefix_link = self._from_prefix(encoded)
-        if prefix_link:
-            log_info(f"Using affiliate link from prefix (ending: {prefix_link[-8:]})")
-            return prefix_link
+            candidate = _canonical_url(candidate)
+            if self._link_matches_product(candidate, product_id=product_id, product_url=cleaned):
+                log_info(f"Using affiliate link from {source} (ending: {candidate[-8:]})")
+                return candidate
 
-        raise RuntimeError("Failed to build affiliate link; check your configuration")
+            log_info(
+                f"Discarded {source} affiliate link that didn't match product; "
+                "falling back to next source"
+            )
+
+        raise RuntimeError(
+            "Failed to build affiliate link that targets the product; check your configuration"
+        )
+
+    def build_shortened(self, product_url: str, *, product_id: str | None = None) -> str:
+        affiliate_url = self.build(product_url, product_id=product_id)
+
+        shortened = self._shorten(affiliate_url)
+        if shortened:
+            if self._link_matches_product(shortened, product_id=product_id, product_url=product_url):
+                return shortened
+
+            log_info(
+                "Discarded short link that did not clearly target the product; "
+                "keeping verified affiliate URL"
+            )
+
+        return affiliate_url
 
 
 # ===============
@@ -652,13 +779,17 @@ class DealBot:
             if resolved_url != _canonical_url(original_url):
                 log_info("Expanded short link to capture the real product URL before affiliation")
 
-            product_id = normalize_aliexpress_id(resolved_url)
-            eligible_candidates += 1
+            product_url = canonical_product_url(resolved_url)
+            if product_url != resolved_url:
+                log_info("Normalized resolved URL to direct product page before affiliation")
+
+            product_id = normalize_aliexpress_id(product_url)
 
             if product_id in self.processed_product_ids:
                 log_info(f"Already handled product_id={product_id} earlier this run; skipping")
                 _mark_skip("duplicate this run")
                 continue
+            eligible_candidates += 1
 
             if await self.already_posted(product_id):
                 log_info(f"Already posted product_id={product_id}, skipping")
@@ -666,7 +797,9 @@ class DealBot:
                 _mark_skip("duplicate previously posted")
                 continue
 
-            affiliate_url = self.affiliate_builder.build(resolved_url)
+            affiliate_url = self.affiliate_builder.build_shortened(
+                product_url, product_id=product_id
+            )
 
             source_without_links = strip_non_affiliate_links(msg.message, affiliate_url)
             if source_without_links != msg.message:
@@ -761,6 +894,7 @@ class DealBot:
             "Starting run with "
             f"dry_run={self.config.dry_run}, sources={len(self.config.tg_source_channels)}, "
             f"target={self.config.tg_target_channel}, affiliate_mode={self.config.describe_affiliate_mode()}, "
+            f"shortener={'on' if self.config.affiliate_shortener_endpoint else 'off'}, "
             f"max_posts_per_run={self.config.max_posts_per_run}, require_keywords={self.config.require_keywords}, "
             f"min_views={self.config.min_views}, max_message_age_minutes={self.config.max_message_age_minutes}"
         )
