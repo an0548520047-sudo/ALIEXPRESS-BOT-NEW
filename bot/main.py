@@ -238,6 +238,29 @@ def resolve_final_url(url: str, *, enabled: bool, timeout_seconds: float) -> str
     return normalized
 
 
+def canonical_product_url(url: str) -> str:
+    """Return a clean product URL so affiliate builders don't double-wrap tracking links.
+
+    This strips URL encoding and normalizes to a direct `/item/<id>.html` link when we can
+    extract an item id. If we cannot find an item id, the cleaned canonical URL is returned
+    so we still make progress.
+    """
+
+    decoded = _canonical_url(unquote(url))
+
+    id_match = re.search(r"/item/(\d+)\.html", decoded)
+    if id_match:
+        item_id = id_match.group(1)
+        return f"https://www.aliexpress.com/item/{item_id}.html"
+
+    loose_match = re.search(r"/(\d{7,})\.html", decoded)
+    if loose_match:
+        item_id = loose_match.group(1)
+        return f"https://www.aliexpress.com/item/{item_id}.html"
+
+    return decoded
+
+
 def _strip_urls_with_affiliate(content: str, affiliate_url: str, append_if_missing: bool) -> Tuple[str, bool]:
     url_regex = re.compile(r"https?://\S+")
     encoded_url_regex = re.compile(r"https?%3A%2F%2F\S+", re.IGNORECASE)
@@ -652,7 +675,11 @@ class DealBot:
             if resolved_url != _canonical_url(original_url):
                 log_info("Expanded short link to capture the real product URL before affiliation")
 
-            product_id = normalize_aliexpress_id(resolved_url)
+            product_url = canonical_product_url(resolved_url)
+            if product_url != resolved_url:
+                log_info("Normalized resolved URL to direct product page before affiliation")
+
+            product_id = normalize_aliexpress_id(product_url)
             eligible_candidates += 1
 
             if product_id in self.processed_product_ids:
@@ -666,7 +693,7 @@ class DealBot:
                 _mark_skip("duplicate previously posted")
                 continue
 
-            affiliate_url = self.affiliate_builder.build(resolved_url)
+            affiliate_url = self.affiliate_builder.build(product_url)
 
             source_without_links = strip_non_affiliate_links(msg.message, affiliate_url)
             if source_without_links != msg.message:
