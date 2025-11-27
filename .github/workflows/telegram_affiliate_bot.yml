@@ -1,0 +1,60 @@
+name: Telegram Affiliate Bot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      TG_SESSION: ${{ secrets.TG_SESSION }}
+      TG_SOURCE_CHANNELS: ${{ secrets.TG_SOURCE_CHANNELS }}
+      TG_TARGET_CHANNEL: ${{ secrets.TG_TARGET_CHANNEL }}
+      AFFILIATE_API_ENDPOINT: ${{ secrets.AFFILIATE_API_ENDPOINT }}
+      AFFILIATE_API_TOKEN: ${{ secrets.AFFILIATE_API_TOKEN }}
+      AFFILIATE_API_TIMEOUT: ${{ secrets.AFFILIATE_API_TIMEOUT }}
+      AFFILIATE_PORTAL_LINK: ${{ secrets.AFFILIATE_PORTAL_LINK }}
+      AFFILIATE_PREFIX: ${{ secrets.AFFILIATE_PREFIX }}
+      AFFILIATE_PREFIX_ENCODE: ${{ secrets.AFFILIATE_PREFIX_ENCODE || 'true' }}
+      ALLOW_PREFIX_FALLBACK: ${{ secrets.ALLOW_PREFIX_FALLBACK || 'false' }}
+      REQUIRE_PORTAL_AFFILIATE: ${{ secrets.REQUIRE_PORTAL_AFFILIATE || 'true' }}
+      REQUIRE_SHORT_LINKS: ${{ secrets.REQUIRE_SHORT_LINKS || 'false' }}
+      AFFILIATE_SHORTENER_ENDPOINT: ${{ secrets.AFFILIATE_SHORTENER_ENDPOINT }}
+      AFFILIATE_SHORTENER_TOKEN: ${{ secrets.AFFILIATE_SHORTENER_TOKEN }}
+      AFFILIATE_SHORTENER_TIMEOUT: ${{ secrets.AFFILIATE_SHORTENER_TIMEOUT || '4' }}
+      RESOLVE_REDIRECTS: ${{ secrets.RESOLVE_REDIRECTS || 'true' }}
+      RESOLVE_REDIRECT_TIMEOUT: ${{ secrets.RESOLVE_REDIRECT_TIMEOUT || '4' }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: "gpt-4.1-mini"
+      DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
+      MAX_POSTS_PER_RUN: ${{ secrets.MAX_POSTS_PER_RUN || '5' }}
+      MESSAGE_COOLDOWN_SECONDS: ${{ secrets.MESSAGE_COOLDOWN_SECONDS || '5' }}
+      MAX_MESSAGE_AGE_MINUTES: ${{ secrets.MAX_MESSAGE_AGE_MINUTES || '240' }}
+      MAX_MESSAGES_PER_CHANNEL: ${{ secrets.MAX_MESSAGES_PER_CHANNEL || '80' }}
+      MIN_VIEWS: ${{ secrets.MIN_VIEWS || '1500' }}
+      REQUIRE_KEYWORDS: ${{ secrets.REQUIRE_KEYWORDS || 'false' }}
+      KEYWORD_ALLOWLIST: ${{ secrets.KEYWORD_ALLOWLIST }}
+      KEYWORD_BLOCKLIST: ${{ secrets.KEYWORD_BLOCKLIST }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        run: |
+          python -m bot.main
