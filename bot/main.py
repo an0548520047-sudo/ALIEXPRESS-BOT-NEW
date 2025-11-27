@@ -202,3 +202,327 @@ class Config:
             return "portal API endpoint (Signed)"
         if self.affiliate_portal_template:
             return "portal template"
+        return "prefix-based affiliate link"
+
+
+# =======================
+# Affiliate link pipeline
+# =======================
+
+
+def _canonical_url(url: str) -> str:
+    return url.strip().strip("[]()<>.,")
+
+
+def clean_product_url(url: str) -> str:
+    """
+    Cleans an AliExpress URL to its bare minimum (item ID) to avoid tracking conflicts.
+    """
+    try:
+        # Handle star.aliexpress / share links specifically
+        if "star.aliexpress.com" in url or "/share/share.htm" in url:
+            return url 
+
+        parsed = urlparse(url)
+        # Keep only scheme, netloc, and path
+        clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        
+        if "/item/" in clean:
+            return clean
+            
+        return clean
+    except:
+        return url
+
+
+def resolve_final_url(url: str, *, enabled: bool, timeout_seconds: float) -> str:
+    if not enabled:
+        return url
+
+    normalized = _canonical_url(url)
+    
+    # List of domains that MUST be resolved to find the real product
+    resolve_triggers = ["s.click", "bit.ly", "star.aliexpress", "a.aliexpress", "/share/"]
+    
+    if not any(trigger in normalized.lower() for trigger in resolve_triggers):
+        return normalized
+
+    try:
+        timeout = httpx.Timeout(timeout_seconds, connect=timeout_seconds, read=timeout_seconds, write=timeout_seconds)
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+
+        with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+            response = client.get(normalized)
+        
+        if response.url:
+            final_url = str(response.url)
+            final_url = final_url.replace("he.aliexpress", "www.aliexpress")
+            
+            return final_url
+            
+    except Exception as exc:
+        print(f"Redirect resolution failed: {exc}")
+
+    return normalized
+
+
+def ensure_affiliate_link(content: str, affiliate_url: str) -> Tuple[str, bool]:
+    normalized = _canonical_url(affiliate_url)
+    
+    if normalized in content:
+        return content, False
+
+    phrases = ["👇 לקנייה באליאקספרס:", "לקנייה:", "לינק:", "קישור:", "Link:", "Buy:"]
+    
+    lines = content.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        if any(p in line for p in phrases):
+            continue
+        cleaned_lines.append(line)
+    
+    clean_content = '\n'.join(cleaned_lines).strip()
+    
+    enforced_block = f"👇 לקנייה באליאקספרס:\n{normalized}"
+    return f"{clean_content}\n\n{enforced_block}", True
+
+
+class AffiliateLinkBuilder:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def _sign_params(self, params: Dict[str, str]) -> str:
+        if not self.config.affiliate_app_secret:
+            return ""
+        sorted_keys = sorted(params.keys())
+        param_str = ""
+        for key in sorted_keys:
+            param_str += f"{key}{params[key]}"
+        sign_source = f"{self.config.affiliate_app_secret}{param_str}{self.config.affiliate_app_secret}"
+        return hashlib.md5(sign_source.encode("utf-8")).hexdigest().upper()
+
+    def _from_api(self, original_url: str) -> str | None:
+        if not self.config.affiliate_api_endpoint or not self.config.affiliate_app_key:
+            return None
+
+        timestamp = str(int(time.time() * 1000))
+        params = {
+            "app_key": self.config.affiliate_app_key,
+            "timestamp": timestamp,
+            "sign_method": "md5",
+            "urls": original_url,
+            "promotion_link_type": "0",
+            "tracking_id": "default",
+            "format": "json",
+            "v": "2.0"
+        }
+        params["sign"] = self._sign_params(params)
+        headers = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+        
+        try:
+            with httpx.Client(timeout=self.config.affiliate_api_timeout) as http_client:
+                response = http_client.post(self.config.affiliate_api_endpoint, data=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "aliexpress_affiliate_link_generate_response" in data:
+                resp_body = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
+                promotions = resp_body.get("promotion_links", {}).get("promotion_link", [])
+                if promotions:
+                    return _canonical_url(promotions[0].get("promotion_link"))
+            
+            candidates = [
+                data.get("result", {}).get("promotion_links", [{}])[0].get("promotion_link") if data.get("result") else None,
+                data.get("promotion_link")
+            ]
+            for cand in candidates:
+                if cand: return _canonical_url(cand)
+                
+        except Exception as exc:
+            print(f"API call failed: {exc}")
+            return None
+        return None
+
+    def _from_portal_template(self, clean_url: str) -> str | None:
+        if not self.config.affiliate_portal_template:
+            return None
+        
+        encoded = quote(clean_url, safe="")
+        template = self.config.affiliate_portal_template
+        
+        if "{url}" in template:
+            return template.replace("{url}", encoded).strip()
+        return template.strip()
+
+    def build(self, original_url: str) -> str:
+        resolved = resolve_final_url(original_url, enabled=self.config.resolve_redirects, timeout_seconds=self.config.resolve_redirect_timeout)
+        cleaned = clean_product_url(resolved)
+        
+        api_link = self._from_api(cleaned)
+        if api_link:
+            print(f"Using affiliate link from API")
+            return api_link
+
+        portal_link = self._from_portal_template(cleaned)
+        if portal_link:
+            print(f"Using affiliate link from portal template")
+            return portal_link
+
+        return cleaned
+
+
+# ===============
+# Caption creator
+# ===============
+
+
+def extract_fact_hints(text: str) -> Dict[str, str]:
+    hints: Dict[str, str] = {}
+    price_match = re.search(r"(₪|\$)\s?\d+[\d.,]*", text)
+    if price_match: hints["price"] = price_match.group(0)
+    rating_match = re.search(r"(?:⭐|rating[:\s]*)(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    if rating_match: hints["rating"] = rating_match.group(1)
+    orders_match
+    orders_match = re.search(r"(\d[\d.,]*\+?)\s*(?:orders|הזמנות|sold)", text, re.IGNORECASE)
+    if orders_match: hints["orders"] = orders_match.group(1)
+    coupon_matches = re.findall(r"(?:קופון|coupon|code)[:\s]*([A-Za-z0-9-]+)", text, re.IGNORECASE)
+    if coupon_matches: hints["coupons"] = ", ".join(dict.fromkeys(coupon_matches))
+    return hints
+
+
+def _fallback_caption(orig_text: str, affiliate_url: str) -> str:
+    cleaned = orig_text.strip().splitlines()
+    headline = cleaned[0] if cleaned else "מצאתי דיל ששווה להציץ בו"
+    return f"{headline}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
+
+
+class CaptionWriter:
+    def __init__(self, openai_client: OpenAI, config: Config):
+        self.client = openai_client
+        self.model = config.openai_model
+
+    def write(self, orig_text: str, affiliate_url: str) -> str:
+        hints = extract_fact_hints(orig_text)
+        hints_str = "\n".join([f"- {k}: {v}" for k, v in hints.items()])
+        
+        prompt = f"""
+תכתוב פוסט דיל קצר וקולע לטלגרם בעברית על בסיס הטקסט למטה.
+סגנון: חברי, קצר, אימוג'י אחד או שניים.
+מבנה:
+1. כותרת מושכת.
+2. 2-3 בולטים על המוצר.
+3. מחיר וקופונים אם יש.
+אל תכתוב "לקנייה" ואל תוסיף קישור - אני אוסיף את זה לבד.
+
+מידע:
+{orig_text}
+{hints_str}
+"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=0.6,
+                max_tokens=400,
+            )
+            return response.choices[0].message.content.strip()
+        except:
+            return _fallback_caption(orig_text, "")
+
+
+# ===================
+# Deal bot main logic
+# ===================
+
+
+ali_regex = re.compile(r"https?://[^\s]*aliexpress\.com[^\s]*", re.IGNORECASE)
+
+
+def extract_aliexpress_links(text: str) -> List[str]:
+    if not text: return []
+    return ali_regex.findall(text)
+
+
+def normalize_aliexpress_id(url: str) -> str:
+    clean = _canonical_url(url)
+    match = re.search(r"/item/(\d+)\.html", clean)
+    return match.group(1) if match else "unknown"
+
+
+def format_message(content: str, product_id: str) -> str:
+    return content.replace(f"(id:{product_id})", "").strip() + f"\n\n(id:{product_id})"
+
+
+def log_info(message: str) -> None:
+    print(message, flush=True)
+
+
+class DealBot:
+    def __init__(self, client: TelegramClient, caption_writer: CaptionWriter, affiliate_builder: AffiliateLinkBuilder, config: Config):
+        self.client = client
+        self.caption_writer = caption_writer
+        self.affiliate_builder = affiliate_builder
+        self.config = config
+        self.processed_ids = set()
+
+    async def run(self):
+        log_info("Starting bot...")
+        for channel in self.config.tg_source_channels:
+            async for msg in self.client.iter_messages(channel, limit=self.config.max_messages_per_channel):
+                if not msg.message: continue
+                
+                links = extract_aliexpress_links(msg.message)
+                if not links: continue
+                
+                original_url = links[0]
+                
+                affiliate_url = self.affiliate_builder.build(original_url)
+                
+                prod_id = normalize_aliexpress_id(original_url)
+                if prod_id in self.processed_ids: continue
+                
+                caption = self.caption_writer.write(msg.message, affiliate_url)
+                
+                final_text, _ = ensure_affiliate_link(caption, affiliate_url)
+                final_text = format_message(final_text, prod_id)
+                
+                try:
+                    if msg.media:
+                        await self.client.send_file(self.config.tg_target_channel, msg.media, caption=final_text)
+                    else:
+                        await self.client.send_message(self.config.tg_target_channel, final_text)
+                    
+                    log_info(f"Posted {prod_id}")
+                    self.processed_ids.add(prod_id)
+                    
+                    if len(self.processed_ids) >= self.config.max_posts_per_run:
+                        return
+                        
+                except Exception as e:
+                    log_info(f"Error posting: {e}")
+
+
+async def main() -> None:
+    config = Config.from_env()
+    client = TelegramClient(StringSession(config.tg_session), config.tg_api_id, config.tg_api_hash)
+    oa_client = OpenAI(api_key=config.openai_api_key)
+
+    bot = DealBot(
+        client=client,
+        caption_writer=CaptionWriter(oa_client, config),
+        affiliate_builder=AffiliateLinkBuilder(config),
+        config=config,
+    )
+
+    await client.start()
+    async with client:
+        await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
