@@ -8,7 +8,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import httpx
 from openai import OpenAI
@@ -133,10 +133,9 @@ class Config:
     tg_source_channels: List[str]
     tg_target_channel: str
     
-    # Affiliate Settings
     affiliate_api_endpoint: str | None
-    affiliate_app_key: str | None      # NEW: For API signing
-    affiliate_app_secret: str | None   # NEW: For API signing
+    affiliate_app_key: str | None
+    affiliate_app_secret: str | None
     affiliate_api_timeout: float
     affiliate_portal_template: str | None
     affiliate_prefix: str | None
@@ -164,14 +163,11 @@ class Config:
         affiliate_api_endpoint = _optional_str("AFFILIATE_API_ENDPOINT")
         affiliate_portal_template = _optional_str("AFFILIATE_PORTAL_LINK")
         affiliate_prefix = _optional_str("AFFILIATE_PREFIX")
-
-        # Try to load API credentials (optional, but needed for proper API mode)
         affiliate_app_key = _optional_str("ALIEXPRESS_API_APP_KEY")
         affiliate_app_secret = _optional_str("ALIEXPRESS_API_APP_SECRET")
 
+        # Allow running if at least one method is present
         if not (affiliate_api_endpoint or affiliate_portal_template or affiliate_prefix):
-            # We allow running if at least one method is present.
-            # If strict mode is enforced elsewhere, logic handles it.
             pass
 
         return cls(
@@ -193,9 +189,7 @@ class Config:
             dry_run=_bool_env("DRY_RUN", False),
             require_keywords=_bool_env("REQUIRE_KEYWORDS", False),
             max_posts_per_run=_int_env("MAX_POSTS_PER_RUN", 5, min_value=1),
-            message_cooldown_seconds=_float_env(
-                "MESSAGE_COOLDOWN_SECONDS", 5.0, allow_zero=True, min_value=0.0
-            ),
+            message_cooldown_seconds=_float_env("MESSAGE_COOLDOWN_SECONDS", 5.0, allow_zero=True, min_value=0.0),
             max_message_age_minutes=_int_env("MAX_MESSAGE_AGE_MINUTES", 240, min_value=1),
             keyword_allowlist=_list_env("KEYWORD_ALLOWLIST"),
             keyword_blocklist=_list_env("KEYWORD_BLOCKLIST"),
@@ -207,9 +201,7 @@ class Config:
         if self.affiliate_api_endpoint:
             return "portal API endpoint (Signed)"
         if self.affiliate_portal_template:
-            if "{url}" in self.affiliate_portal_template:
-                return "portal template with {url} placeholder"
-            return "portal template (verbatim link)"
+            return "portal template"
         return "prefix-based affiliate link"
 
 
@@ -222,13 +214,33 @@ def _canonical_url(url: str) -> str:
     return url.strip().strip("[]()<>.,")
 
 
+def clean_product_url(url: str) -> str:
+    """
+    Cleans an AliExpress URL to its bare minimum (item ID) to avoid tracking conflicts.
+    Converts: https://www.aliexpress.com/item/12345.html?spm=...
+    To: https://www.aliexpress.com/item/12345.html
+    """
+    try:
+        parsed = urlparse(url)
+        # Keep only scheme, netloc, and path
+        # Remove query params completely to ensure clean redirection
+        clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        
+        # Double check if it's an item link
+        if "/item/" in clean:
+            return clean
+        
+        # If it's a short link that resolved to something else, return as is but without query
+        return clean
+    except:
+        return url
+
+
 def resolve_final_url(url: str, *, enabled: bool, timeout_seconds: float) -> str:
-    """Follow redirects for AliExpress short links to capture the real product URL."""
     if not enabled:
         return url
 
     normalized = _canonical_url(url)
-    # Only resolve known shorteners or tracking links
     if "s.click.aliexpress.com" not in normalized.lower() and "bit.ly" not in normalized.lower():
         return normalized
 
@@ -238,66 +250,38 @@ def resolve_final_url(url: str, *, enabled: bool, timeout_seconds: float) -> str
             response = client.get(normalized)
         if response.history and response.url:
             final_url = str(response.url)
-            log_info(f"Resolved short link to final URL (ending: {final_url[-12:]})")
+            log_info(f"Resolved short link to final URL")
             return final_url
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log_info(f"Redirect resolution failed; using original URL: {exc}")
 
     return normalized
 
 
-def _strip_urls_with_affiliate(content: str, affiliate_url: str, append_if_missing: bool) -> Tuple[str, bool]:
-    url_regex = re.compile(r"https?://\S+")
-    encoded_url_regex = re.compile(r"https?%3A%2F%2F\S+", re.IGNORECASE)
-
-    normalized_aff = _canonical_url(affiliate_url)
-    seen_affiliate = False
-
-    def _replacer(match: re.Match[str]) -> str:
-        nonlocal seen_affiliate
-        decoded = _canonical_url(unquote(match.group(0)))
-        if normalized_aff in decoded and not seen_affiliate:
-            seen_affiliate = True
-            return normalized_aff
-        return ""
-
-    cleaned = content
-    for pattern in (url_regex, encoded_url_regex):
-        cleaned = pattern.sub(_replacer, cleaned)
-
-    if append_if_missing and not seen_affiliate:
-        cleaned = f"{cleaned.rstrip()}\n\n👇 לקנייה באליאקספרס:\n{normalized_aff}".strip()
-        seen_affiliate = True
-
-    occurrences = cleaned.count(normalized_aff)
-    if occurrences > 1:
-        cleaned = cleaned.replace(normalized_aff, "", occurrences - 1)
-
-    return cleaned.strip(), seen_affiliate
-
-
-def strip_non_affiliate_links(content: str, affiliate_url: str) -> str:
-    cleaned, _ = _strip_urls_with_affiliate(content, affiliate_url, append_if_missing=False)
-    return cleaned
-
-
 def ensure_affiliate_link(content: str, affiliate_url: str) -> Tuple[str, bool]:
     normalized = _canonical_url(affiliate_url)
+    
+    # Check if the link is already there
     if normalized in content:
         return content, False
 
-    if "👇 לקנייה באליאקספרס" in content:
-        return content.rstrip() + f"\n{normalized}", True
-
+    # Check for common "Buy Now" phrases to avoid duplication
+    phrases = ["👇 לקנייה באליאקספרס:", "לקנייה:", "לינק:", "קישור:", "Link:", "Buy:"]
+    
+    lines = content.split('\n')
+    cleaned_lines = []
+    found_phrase = False
+    
+    for line in lines:
+        # If we find a line that looks like a buy header, we skip it (we will add our own)
+        if any(p in line for p in phrases):
+            continue
+        cleaned_lines.append(line)
+    
+    clean_content = '\n'.join(cleaned_lines).strip()
+    
     enforced_block = f"👇 לקנייה באליאקספרס:\n{normalized}"
-    return content.rstrip() + f"\n\n{enforced_block}", True
-
-
-def enforce_single_affiliate_link(content: str, affiliate_url: str) -> str:
-    cleaned, seen = _strip_urls_with_affiliate(content, affiliate_url, append_if_missing=False)
-    if not seen:
-        cleaned, _ = _strip_urls_with_affiliate(cleaned, affiliate_url, append_if_missing=True)
-    return cleaned
+    return f"{clean_content}\n\n{enforced_block}", True
 
 
 class AffiliateLinkBuilder:
@@ -305,124 +289,88 @@ class AffiliateLinkBuilder:
         self.config = config
 
     def _sign_params(self, params: Dict[str, str]) -> str:
-        """Generates the MD5 signature for AliExpress API."""
         if not self.config.affiliate_app_secret:
             return ""
-        
-        # Sort keys and concatenate key+value
         sorted_keys = sorted(params.keys())
         param_str = ""
         for key in sorted_keys:
             param_str += f"{key}{params[key]}"
-            
-        # Sign structure: secret + param_str + secret
         sign_source = f"{self.config.affiliate_app_secret}{param_str}{self.config.affiliate_app_secret}"
         return hashlib.md5(sign_source.encode("utf-8")).hexdigest().upper()
 
     def _from_api(self, original_url: str) -> str | None:
-        if not self.config.affiliate_api_endpoint:
+        if not self.config.affiliate_api_endpoint or not self.config.affiliate_app_key:
             return None
 
-        # If we have app_key/secret, we build a signed request
-        if self.config.affiliate_app_key and self.config.affiliate_app_secret:
-            timestamp = str(int(time.time() * 1000))
-            params = {
-                "app_key": self.config.affiliate_app_key,
-                "timestamp": timestamp,
-                "sign_method": "md5",
-                "urls": original_url,
-                "promotion_link_type": "0", # 0 for normal link, 2 for hot link
-                "tracking_id": "default",   # or your specific tracking ID
-                "format": "json",
-                "v": "2.0"
-            }
+        timestamp = str(int(time.time() * 1000))
+        params = {
+            "app_key": self.config.affiliate_app_key,
+            "timestamp": timestamp,
+            "sign_method": "md5",
+            "urls": original_url,
+            "promotion_link_type": "0",
+            "tracking_id": "default",
+            "format": "json",
+            "v": "2.0"
+        }
+        params["sign"] = self._sign_params(params)
+        headers = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+        
+        try:
+            with httpx.Client(timeout=self.config.affiliate_api_timeout) as http_client:
+                response = http_client.post(self.config.affiliate_api_endpoint, data=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
             
-            # Add signature
-            params["sign"] = self._sign_params(params)
+            if "aliexpress_affiliate_link_generate_response" in data:
+                resp_body = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
+                promotions = resp_body.get("promotion_links", {}).get("promotion_link", [])
+                if promotions:
+                    return _canonical_url(promotions[0].get("promotion_link"))
             
-            # Prepare headers (Form URL Encoded is standard for this API)
-            headers = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
-            
-            try:
-                timeout = httpx.Timeout(self.config.affiliate_api_timeout)
-                log_info(f"Calling Signed API with timeout={self.config.affiliate_api_timeout}s")
+            candidates = [
+                data.get("result", {}).get("promotion_links", [{}])[0].get("promotion_link") if data.get("result") else None,
+                data.get("promotion_link")
+            ]
+            for cand in candidates:
+                if cand: return _canonical_url(cand)
                 
-                with httpx.Client(timeout=timeout) as http_client:
-                    # Note: AliExpress often takes params in the URL or form body. 
-                    # Using 'data' for form-urlencoded is safest.
-                    response = http_client.post(
-                        self.config.affiliate_api_endpoint, 
-                        data=params, 
-                        headers=headers
-                    )
-                response.raise_for_status()
-                
-                data = response.json()
-                
-                # Try to extract link from typical AliExpress structure
-                if "aliexpress_affiliate_link_generate_response" in data:
-                    resp_body = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
-                    promotions = resp_body.get("promotion_links", {}).get("promotion_link", [])
-                    if promotions:
-                        return _canonical_url(promotions[0].get("promotion_link"))
-                
-                # Fallback for other API formats (Gateway style)
-                candidates = [
-                    data.get("result", {}).get("promotion_links", [{}])[0].get("promotion_link") if data.get("result") else None,
-                    data.get("promotion_link")
-                ]
-                
-                for cand in candidates:
-                    if cand:
-                        return _canonical_url(cand)
-                        
-                log_info(f"API Response OK but no link found: {str(data)[:200]}...")
-                
-            except Exception as exc:
-                log_info(f"Signed API call failed: {exc}")
-                return None
-
-        # Fallback: Old logic if no app_key/secret (or if user uses a proxy API)
-        # ... (Your original simple logic could go here if needed)
+        except Exception as exc:
+            log_info(f"API call failed: {exc}")
+            return None
         return None
 
-    def _from_portal_template(self, encoded_url: str) -> str | None:
+    def _from_portal_template(self, clean_url: str) -> str | None:
         if not self.config.affiliate_portal_template:
             return None
+        
+        # We encode the CLEAN URL only
+        encoded = quote(clean_url, safe="")
         template = self.config.affiliate_portal_template
+        
         if "{url}" in template:
-            return template.replace("{url}", encoded_url).strip()
+            return template.replace("{url}", encoded).strip()
         return template.strip()
 
-    def _from_prefix(self, encoded_url: str) -> str | None:
-        if not self.config.affiliate_prefix:
-            return None
-        return f"{self.config.affiliate_prefix}{encoded_url}"
-
     def build(self, original_url: str) -> str:
-        cleaned = _canonical_url(unquote(original_url))
-        encoded = quote(cleaned, safe="")
-
-        # 1. Try API (Best)
+        # 1. Resolve Redirects (e.g. bit.ly or s.click)
+        resolved = resolve_final_url(original_url, enabled=self.config.resolve_redirects, timeout_seconds=self.config.resolve_redirect_timeout)
+        
+        # 2. Clean the URL (Remove all tracking params from the source!)
+        cleaned = clean_product_url(resolved)
+        
+        # 3. Try API
         api_link = self._from_api(cleaned)
         if api_link:
-            log_info(f"Using affiliate link from API (ending: {api_link[-8:]})")
+            log_info(f"Using affiliate link from API")
             return api_link
 
-        # 2. Try Portal Template (Good)
-        portal_link = self._from_portal_template(encoded)
+        # 4. Try Portal Template (This is what you are using now)
+        portal_link = self._from_portal_template(cleaned)
         if portal_link:
-            log_info(f"Using affiliate link from portal template (ending: {portal_link[-8:]})")
+            log_info(f"Using affiliate link from portal template")
             return portal_link
 
-        # 3. Try Prefix (Fallback)
-        prefix_link = self._from_prefix(encoded)
-        if prefix_link:
-            log_info(f"Using affiliate link from prefix (ending: {prefix_link[-8:]})")
-            return prefix_link
-
-        # If all fail, just return original to avoid crashing (or raise if strict)
-        log_info("WARNING: Failed to build affiliate link; returning original.")
         return cleaned
 
 
@@ -433,41 +381,21 @@ class AffiliateLinkBuilder:
 
 def extract_fact_hints(text: str) -> Dict[str, str]:
     hints: Dict[str, str] = {}
-
     price_match = re.search(r"(₪|\$)\s?\d+[\d.,]*", text)
-    if price_match:
-        hints["price"] = price_match.group(0)
-
+    if price_match: hints["price"] = price_match.group(0)
     rating_match = re.search(r"(?:⭐|rating[:\s]*)(\d+(?:\.\d+)?)", text, re.IGNORECASE)
-    if rating_match:
-        hints["rating"] = rating_match.group(1)
-
+    if rating_match: hints["rating"] = rating_match.group(1)
     orders_match = re.search(r"(\d[\d.,]*\+?)\s*(?:orders|הזמנות|sold)", text, re.IGNORECASE)
-    if orders_match:
-        hints["orders"] = orders_match.group(1)
-
+    if orders_match: hints["orders"] = orders_match.group(1)
     coupon_matches = re.findall(r"(?:קופון|coupon|code)[:\s]*([A-Za-z0-9-]+)", text, re.IGNORECASE)
-    if coupon_matches:
-        hints["coupons"] = ", ".join(dict.fromkeys(coupon_matches))
-
+    if coupon_matches: hints["coupons"] = ", ".join(dict.fromkeys(coupon_matches))
     return hints
 
 
 def _fallback_caption(orig_text: str, affiliate_url: str) -> str:
     cleaned = orig_text.strip().splitlines()
     headline = cleaned[0] if cleaned else "מצאתי דיל ששווה להציץ בו"
-    bullets = [line for line in cleaned[1:6] if line.strip()][:4]
-    bullet_block = "\n".join(f"• {b.strip()}" for b in bullets) if bullets else "• לפרטים נוספים בקישור"
-
-    return "\n".join(
-        [
-            headline,
-            "הנה הפרטים בקצרה:",
-            bullet_block,
-            "👇 לקנייה באליאקספרס:",
-            _canonical_url(affiliate_url),
-        ]
-    ).strip()
+    return f"{headline}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
 
 
 class CaptionWriter:
@@ -475,70 +403,34 @@ class CaptionWriter:
         self.client = openai_client
         self.model = config.openai_model
 
-    def _build_prompt(self, orig_text: str, affiliate_url: str) -> str:
-        hints = extract_fact_hints(orig_text)
-        hints_block = ""
-        if hints:
-            hints_lines = ["נתונים שזוהו בטקסט:", *(f"- {k}: {v}" for k, v in hints.items())]
-            hints_block = "\n".join(hints_lines)
-        
-        return f"""
-אתה כותב פוסט דיל לקבוצת דילים ישראלית (וואטסאפ / טלגרם).
-הפוסט צריך לצאת מוכן אחד-לאחד להדבקה.
-
-חוקי סגנון:
-- עברית בלבד, טון יומיומי וחי, עם הומור עדין וקצר.
-- 1–3 אימוג'ים בסך הכול, לא יותר.
-- משפטים קצרים, בלי מנופח ובלי "הדיל הכי מטורף בעולם".
-- לא להמציא מידע שלא קיים במקור.
-
-מבנה מחייב:
-1) שורת פתיחה – שאלה יומיומית שמתאימה למוצר (שורה אחת).
-2) משפט אחד קצר שמציג את המוצר כפתרון ברור לשאלה.
-3) בולטים תכל'ס – 3–6 נקודות קצרות (עד ~7–9 מילים): סוג/דגם, יתרונות אמיתיים, שימושים, פרטים טכניים חשובים.
-4) מחיר/דירוג/הזמנות – רק אם קיימים במידע: 
-   • "💰 מחיר אחרי הנחות: <מחיר>" (אפשר ש"ח ו-$ אם הופיע).
-   • "⭐ דירוג: X.X" אם יש.
-   • "📦 מס' הזמנות: XXXX+" אם יש.
-   • אם מצוין שהמיסים לא כלולים – לרשום במשפט קצר.
-5) קופונים – רק אם קיימים במידע: שורה "🎁 קופונים:" ואז רשימה מסודרת; אם יש סדר שימוש – לציין "קודם X ואז Y".
-6) קישור קנייה: שורה "👇 לקנייה באליאקספרס:" ואז בשורה הבאה הלינק {affiliate_url}.
-
-דגשים:
-- להשתמש רק במה שמופיע במידע המקורי. לא להוסיף קישורים אחרים, לא לחזור על הלינק יותר מפעם אחת.
-- לא להזכיר שזה הועתק מקבוצה אחרת. לא להגזים, טון טבעי.
-
-{hints_block}
-
-המידע הגולמי (תיאור/מחיר/דירוג/קופונים/קישור וכו'):
----
-{orig_text}
----
-"""
-
     def write(self, orig_text: str, affiliate_url: str) -> str:
-        prompt = self._build_prompt(orig_text, affiliate_url)
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "אתה כותב קופי בעברית לקבוצת דילים בטלגרם. שמור על מבנה קבוע, "
-                        "טון חי וענייני, ואל תמציא פרטים או קישורים נוספים."
-                    ),
-                },
-                {"role": "user", "content": prompt.strip()},
-            ],
-            temperature=0.6,
-            max_tokens=500,
-        )
-        content = response.choices[0].message.content or ""
-        if not content.strip():
-            log_info("OpenAI returned empty content; using fallback caption")
-            return _fallback_caption(orig_text, affiliate_url)
+        hints = extract_fact_hints(orig_text)
+        hints_str = "\n".join([f"- {k}: {v}" for k, v in hints.items()])
+        
+        # Note: We instruct OpenAI NOT to include the link, we will add it safely later
+        prompt = f"""
+תכתוב פוסט דיל קצר וקולע לטלגרם בעברית על בסיס הטקסט למטה.
+סגנון: חברי, קצר, אימוג'י אחד או שניים.
+מבנה:
+1. כותרת מושכת.
+2. 2-3 בולטים על המוצר.
+3. מחיר וקופונים אם יש.
+אל תכתוב "לקנייה" ואל תוסיף קישור - אני אוסיף את זה לבד.
 
-        return content.strip()
+מידע:
+{orig_text}
+{hints_str}
+"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=0.6,
+                max_tokens=400,
+            )
+            return response.choices[0].message.content.strip()
+        except:
+            return _fallback_caption(orig_text, "")
 
 
 # ===================
@@ -550,80 +442,19 @@ ali_regex = re.compile(r"https?://[^\s]*aliexpress\.com[^\s]*", re.IGNORECASE)
 
 
 def extract_aliexpress_links(text: str) -> List[str]:
-    if not text:
-        return []
+    if not text: return []
     return ali_regex.findall(text)
 
 
 def normalize_aliexpress_id(url: str) -> str:
-    normalized_url = _canonical_url(url)
-
-    click_match = re.search(
-        r"s\.click\.aliexpress\.com/(?:e|aw)/(_?[A-Za-z0-9]+)", normalized_url,
-        re.IGNORECASE,
-    )
-    if click_match:
-        return click_match.group(1).lstrip("_")
-
-    match = re.search(r"/item/(\d+)\.html", normalized_url)
-    if match:
-        return match.group(1)
-
-    match = re.search(r"/(\d+)\.html", normalized_url)
-    if match:
-        return match.group(1)
-
-    return normalized_url.split("?")[0]
-
-
-def evaluate_post_quality(
-    msg: Message,
-    *,
-    min_views: int,
-    keyword_blocklist: Iterable[str],
-    keyword_allowlist: Iterable[str],
-    require_keywords: bool,
-    max_message_age_minutes: int,
-) -> Tuple[bool, str | None]:
-    if not msg.message:
-        return False, "empty message"
-
-    text = msg.message.lower()
-    keywords = ["₪", "$", "discount", "coupon", "קופון", "דיל", "מבצע", "%", "קוד"]
-
-    if keyword_blocklist and any(blocked in text for blocked in keyword_blocklist):
-        return False, "blocked keyword"
-
-    allow_sources: Iterable[str] = ()
-    missing_reason = None
-
-    if keyword_allowlist:
-        allow_sources = keyword_allowlist
-        missing_reason = "missing allowlist keywords"
-    elif require_keywords:
-        allow_sources = keywords
-        missing_reason = "missing keywords"
-
-    if allow_sources and not any(keyword in text for keyword in allow_sources):
-        return False, missing_reason
-
-    if msg.views is not None and msg.views < min_views:
-        return False, "below min views"
-
-    if msg.date:
-        message_dt = msg.date
-        if message_dt.tzinfo is None:
-            message_dt = message_dt.replace(tzinfo=timezone.utc)
-
-        age_minutes = (datetime.now(timezone.utc) - message_dt).total_seconds() / 60
-        if age_minutes > max_message_age_minutes:
-            return False, "too old"
-
-    return True, None
+    clean = _canonical_url(url)
+    match = re.search(r"/item/(\d+)\.html", clean)
+    return match.group(1) if match else "unknown"
 
 
 def format_message(content: str, product_id: str) -> str:
-    return f"{content}\n\n(id:{product_id})"
+    # Clean invisible chars usually added by telegram
+    return content.replace(f"(id:{product_id})", "").strip() + f"\n\n(id:{product_id})"
 
 
 def log_info(message: str) -> None:
@@ -631,207 +462,54 @@ def log_info(message: str) -> None:
 
 
 class DealBot:
-    def __init__(
-        self,
-        client: TelegramClient,
-        caption_writer: CaptionWriter,
-        affiliate_builder: AffiliateLinkBuilder,
-        config: Config,
-    ) -> None:
+    def __init__(self, client: TelegramClient, caption_writer: CaptionWriter, affiliate_builder: AffiliateLinkBuilder, config: Config):
         self.client = client
         self.caption_writer = caption_writer
         self.affiliate_builder = affiliate_builder
         self.config = config
-        self.processed_product_ids: set[str] = set()
+        self.processed_ids = set()
 
-    async def already_posted(self, product_id: str) -> bool:
-        async for msg in self.client.iter_messages(self.config.tg_target_channel, limit=300):
-            if not isinstance(msg, Message) or not msg.message:
-                continue
-            if f"(id:{product_id})" in msg.message:
-                return True
-        return False
-
-    async def process_channel(self, channel: str) -> Tuple[int, Dict[str, int]]:
-        log_info(f"Scanning source channel: {channel}")
-
-        scanned_messages = 0
-        eligible_candidates = 0
-        posted_count = 0
-        skip_reasons: Dict[str, int] = {}
-
-        def _mark_skip(reason: str) -> None:
-            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-
-        async for msg in self.client.iter_messages(channel, limit=self.config.max_messages_per_channel):
-            scanned_messages += 1
-            if not isinstance(msg, Message) or not msg.message:
-                continue
-
-            links = extract_aliexpress_links(msg.message)
-            if not links:
-                _mark_skip("no aliexpress link")
-                continue
-
-            is_good, reason = evaluate_post_quality(
-                msg,
-                min_views=self.config.min_views,
-                keyword_blocklist=self.config.keyword_blocklist,
-                keyword_allowlist=self.config.keyword_allowlist,
-                require_keywords=self.config.require_keywords,
-                max_message_age_minutes=self.config.max_message_age_minutes,
-            )
-            if not is_good:
-                _mark_skip(reason or "unknown")
-                log_info(f"Skip message in {channel}: {reason}")
-                continue
-
-            original_url = links[0]
-            resolved_url = resolve_final_url(
-                original_url,
-                enabled=self.config.resolve_redirects,
-                timeout_seconds=self.config.resolve_redirect_timeout,
-            )
-            if resolved_url != _canonical_url(original_url):
-                log_info("Expanded short link to capture the real product URL before affiliation")
-
-            product_id = normalize_aliexpress_id(resolved_url)
-            eligible_candidates += 1
-
-            if product_id in self.processed_product_ids:
-                log_info(f"Already handled product_id={product_id} earlier this run; skipping")
-                _mark_skip("duplicate this run")
-                continue
-
-            if await self.already_posted(product_id):
-                log_info(f"Already posted product_id={product_id}, skipping")
-                self.processed_product_ids.add(product_id)
-                _mark_skip("duplicate previously posted")
-                continue
-
-            affiliate_url = self.affiliate_builder.build(resolved_url)
-
-            source_without_links = strip_non_affiliate_links(msg.message, affiliate_url)
-            if source_without_links != msg.message:
-                log_info("Stripped original links from source message to enforce personal URL")
-
-            try:
-                new_caption = self.caption_writer.write(source_without_links or msg.message, affiliate_url)
-            except Exception as exc:  # noqa: BLE001
-                log_info(f"OpenAI rewrite error: {exc}")
-                _mark_skip("rewrite error fallback")
-                new_caption = f"{source_without_links or msg.message}\n\n👇 לקנייה באליאקספרס:\n{affiliate_url}"
-
-            cleaned_caption = strip_non_affiliate_links(new_caption, affiliate_url)
-            secured_caption, appended = ensure_affiliate_link(cleaned_caption, affiliate_url)
-            if appended:
-                log_info("Affiliate link was missing from the rewritten text; appended personal link")
-
-            final_caption = enforce_single_affiliate_link(secured_caption, affiliate_url)
-            if final_caption != secured_caption:
-                log_info("Cleaned extra URLs to keep only the personal affiliate link once")
-
-            final_text = format_message(final_caption, product_id)
-
-            send_success = False
-            media = getattr(msg, "media", None)
-
-            if self.config.dry_run:
-                log_info(
-                    "DRY_RUN is enabled; skipping send. Would have posted "
-                    f"product_id={product_id} to {self.config.tg_target_channel} "
-                    f"with media={'yes' if media else 'no'}"
-                )
-                send_success = True
-            else:
-                if media is not None:
-                    try:
-                        await self.client.send_file(
-                            self.config.tg_target_channel,
-                            media,
-                            caption=final_text,
-                        )
-                        send_success = True
-                        log_info(
-                            f"Posted product_id={product_id} to {self.config.tg_target_channel} "
-                            "with source media attached"
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        log_info(
-                            "Sending with media failed; retrying without attachment: " f"{exc}"
-                        )
-
-                if not send_success:
-                    try:
-                        await self.client.send_message(self.config.tg_target_channel, final_text)
-                        send_success = True
-                        log_info(
-                            f"Posted product_id={product_id} to {self.config.tg_target_channel} "
-                            "(no media)"
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        log_info(
-                            "Error sending message to target channel; will not count as sent: "
-                            f"{exc}"
-                        )
-
-            if send_success:
-                posted_count += 1
-                self.processed_product_ids.add(product_id)
-
-                if posted_count >= self.config.max_posts_per_run:
-                    log_info("Reached MAX_POSTS_PER_RUN; stopping further processing")
-                    break
-
-                if self.config.message_cooldown_seconds > 0:
-                    await asyncio.sleep(self.config.message_cooldown_seconds)
-
-        details = ", ".join(f"{reason}: {count}" for reason, count in skip_reasons.items()) or "none"
-        log_info(
-            "Channel {channel} summary -> scanned={scanned}, candidates={candidates}, posted={posted}, skips={skips}".format(
-                channel=channel,
-                scanned=scanned_messages,
-                candidates=eligible_candidates,
-                posted=posted_count,
-                skips=details,
-            )
-        )
-
-        return posted_count, skip_reasons
-
-    async def run(self) -> None:
-        log_info(
-            "Starting run with "
-            f"dry_run={self.config.dry_run}, sources={len(self.config.tg_source_channels)}, "
-            f"target={self.config.tg_target_channel}, affiliate_mode={self.config.describe_affiliate_mode()}, "
-            f"max_posts_per_run={self.config.max_posts_per_run}, require_keywords={self.config.require_keywords}, "
-            f"min_views={self.config.min_views}, max_message_age_minutes={self.config.max_message_age_minutes}"
-        )
-
-        total_posted = 0
-        total_skip_reasons: Dict[str, int] = {}
-
+    async def run(self):
+        log_info("Starting bot...")
         for channel in self.config.tg_source_channels:
-            channel_posted, channel_skips = await self.process_channel(channel)
-            total_posted += channel_posted
-
-            for reason, count in channel_skips.items():
-                total_skip_reasons[reason] = total_skip_reasons.get(reason, 0) + count
-
-        if total_skip_reasons:
-            summary = ", ".join(f"{reason}: {count}" for reason, count in total_skip_reasons.items())
-            log_info(f"Overall skip summary -> {summary}")
-
-        if total_posted == 0:
-            log_info(
-                "No posts were sent this run. Check skip summary and consider lowering "
-                "filters (MIN_VIEWS, REQUIRE_KEYWORDS) or disabling DRY_RUN for real posting."
-            )
-
-        log_info(
-            "Run completed. Posts sent (including DRY_RUN counts): "
-            f"{total_posted}"
-        )
+            async for msg in self.client.iter_messages(channel, limit=self.config.max_messages_per_channel):
+                if not msg.message: continue
+                
+                links = extract_aliexpress_links(msg.message)
+                if not links: continue
+                
+                # Simple logic: Take first link, build affiliate, write caption, post
+                original_url = links[0]
+                
+                # Resolve & Build Affiliate Link
+                affiliate_url = self.affiliate_builder.build(original_url)
+                
+                # Extract ID for dup check
+                prod_id = normalize_aliexpress_id(original_url)
+                if prod_id in self.processed_ids: continue
+                
+                # Write Caption (Without Link)
+                caption = self.caption_writer.write(msg.message, affiliate_url)
+                
+                # Combine Caption + Link Safely
+                final_text, _ = ensure_affiliate_link(caption, affiliate_url)
+                final_text = format_message(final_text, prod_id)
+                
+                # Post
+                try:
+                    if msg.media:
+                        await self.client.send_file(self.config.tg_target_channel, msg.media, caption=final_text)
+                    else:
+                        await self.client.send_message(self.config.tg_target_channel, final_text)
+                    
+                    log_info(f"Posted {prod_id}")
+                    self.processed_ids.add(prod_id)
+                    
+                    if len(self.processed_ids) >= self.config.max_posts_per_run:
+                        return
+                        
+                except Exception as e:
+                    log_info(f"Error posting: {e}")
 
 
 async def main() -> None:
