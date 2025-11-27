@@ -41,7 +41,8 @@ requirements.txt                          # תלות פייתון
 | `AFFILIATE_PORTAL_LINK` | אחד מהשלושה | תבנית פורטל עם `{url}` או לינק מוכן מראש |
 | `AFFILIATE_PREFIX` | אחד מהשלושה | Prefix ישן של "prefix + URL" |
 | `AFFILIATE_PREFIX_ENCODE` | לא | ברירת מחדל true – אם ה-Prefix כבר מקודד URL בעצמו, שנה ל-`false` כדי למנוע קישורים ארוכים/מקודדים פעמיים |
-| `REQUIRE_PORTAL_AFFILIATE` | לא | `true` כדי לחייב לינק מה-API/תבנית פורטל בלבד בלי ליפול ל-Prefix; אם שניהם נכשלו – הריצה תעצור |
+| `ALLOW_PREFIX_FALLBACK` | לא | ברירת מחדל false – הפעלה ידנית של Prefix אם אין API/תבנית; השאר `false` כדי לכפות רק לינק אישי מהחשבון שלך |
+| `REQUIRE_PORTAL_AFFILIATE` | לא | ברירת מחדל true – מחייב לינק מה-API/תבנית פורטל בלבד; אם שניהם נכשלו הריצה תעצור, אלא אם הפעלת `ALLOW_PREFIX_FALLBACK` |
 | `REQUIRE_SHORT_LINKS` | לא | `true` כדי לדרוש לינק מקוצר תקין; אם אין/נכשל – הריצה תעצור במקום לפרסם לינק ארוך |
 | `AFFILIATE_API_TIMEOUT` | לא | ברירת מחדל 5 שניות (זמן מקס' לחיבור/קריאה מה־API, חייב להיות חיובי) |
 | `AFFILIATE_SHORTENER_ENDPOINT` | לא | אנדפוינט שמקבל `{ "url": "..." }` ומחזיר לינק קצר (נוסף על הזדהות במידת הצורך) |

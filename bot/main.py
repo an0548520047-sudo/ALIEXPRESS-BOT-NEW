@@ -136,6 +136,7 @@ class Config:
     affiliate_portal_template: str | None
     affiliate_prefix: str | None
     affiliate_prefix_encode: bool
+    allow_prefix_fallback: bool
     require_portal_affiliate: bool
     require_short_links: bool
     openai_api_key: str
@@ -156,6 +157,7 @@ class Config:
     affiliate_shortener_timeout: float
 
     @classmethod
+    @classmethod
     def from_env(cls) -> "Config":
         tg_source_channels = [c.strip() for c in _require_env("TG_SOURCE_CHANNELS").split(",") if c.strip()]
         if not tg_source_channels:
@@ -171,7 +173,7 @@ class Config:
                 "AFFILIATE_PORTAL_LINK, or AFFILIATE_PREFIX"
             )
 
-        return cls(
+        config = cls(
             tg_api_id=int(_require_env("TG_API_ID")),
             tg_api_hash=_require_env("TG_API_HASH"),
             tg_session=_require_env("TG_SESSION"),
@@ -183,7 +185,8 @@ class Config:
             affiliate_portal_template=affiliate_portal_template,
             affiliate_prefix=affiliate_prefix,
             affiliate_prefix_encode=_bool_env("AFFILIATE_PREFIX_ENCODE", True),
-            require_portal_affiliate=_bool_env("REQUIRE_PORTAL_AFFILIATE", False),
+            allow_prefix_fallback=_bool_env("ALLOW_PREFIX_FALLBACK", False),
+            require_portal_affiliate=_bool_env("REQUIRE_PORTAL_AFFILIATE", True),
             require_short_links=_bool_env("REQUIRE_SHORT_LINKS", False),
             openai_api_key=_require_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
@@ -218,6 +221,16 @@ class Config:
                 "AFFILIATE_PORTAL_LINK is configured"
             )
 
+        if not config.allow_prefix_fallback and not (
+            config.affiliate_api_endpoint or config.affiliate_portal_template
+        ):
+            raise RuntimeError(
+                "Prefix fallback is disabled and no portal/API link source is configured. "
+                "Set ALLOW_PREFIX_FALLBACK=true only if you intentionally want to use AFFILIATE_PREFIX."
+            )
+
+        return config
+
     def describe_affiliate_mode(self) -> str:
         if self.affiliate_api_endpoint:
             return "portal API endpoint"
@@ -225,7 +238,9 @@ class Config:
             if "{url}" in self.affiliate_portal_template:
                 return "portal template with {url} placeholder"
             return "portal template (verbatim link)"
-        return "prefix-based affiliate link"
+        if self.allow_prefix_fallback:
+            return "prefix-based affiliate link (explicit fallback)"
+        return "no affiliate mode available"
 
 
 # =======================
@@ -344,6 +359,7 @@ def normalize_caption_spacing(content: str) -> str:
     lines = [line.rstrip() for line in content.splitlines()]
     cleaned: List[str] = []
     seen_aff_line = False
+    seen_nonempty: set[str] = set()
 
     for line in lines:
         stripped = line.strip()
@@ -359,8 +375,11 @@ def normalize_caption_spacing(content: str) -> str:
                 continue
             seen_aff_line = True
 
-        if cleaned and cleaned[-1].strip() == stripped:
+        key = stripped.lower()
+        if key in seen_nonempty:
             continue
+
+        seen_nonempty.add(key)
 
         cleaned.append(stripped)
 
@@ -546,7 +565,7 @@ class AffiliateLinkBuilder:
             (self._from_portal_template(encoded), "portal template"),
         ]
 
-        if not self.config.require_portal_affiliate:
+        if self.config.allow_prefix_fallback:
             candidates.append((self._from_prefix(encoded), "prefix"))
 
         for candidate, source in candidates:
@@ -995,7 +1014,7 @@ class DealBot:
             f"dry_run={self.config.dry_run}, sources={len(self.config.tg_source_channels)}, "
             f"target={self.config.tg_target_channel}, affiliate_mode={self.config.describe_affiliate_mode()}, "
             f"shortener={'on' if self.config.affiliate_shortener_endpoint else 'off'}, "
-            f"require_portal_affiliate={self.config.require_portal_affiliate}, "
+            f"require_portal_affiliate={self.config.require_portal_affiliate}, allow_prefix_fallback={self.config.allow_prefix_fallback}, "
             f"require_short_links={self.config.require_short_links}, "
             f"max_posts_per_run={self.config.max_posts_per_run}, require_keywords={self.config.require_keywords}, "
             f"min_views={self.config.min_views}, max_message_age_minutes={self.config.max_message_age_minutes}"
