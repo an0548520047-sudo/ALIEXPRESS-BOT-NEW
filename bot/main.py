@@ -383,14 +383,23 @@ class AffiliateLinkBuilder:
 
 def extract_fact_hints(text: str) -> Dict[str, str]:
     hints: Dict[str, str] = {}
+    # FIX: Initialize all variables to None to avoid UnboundLocalError
+    price_match = None
+    rating_match = None
+    orders_match = None
+
     price_match = re.search(r"(₪|\$)\s?\d+[\d.,]*", text)
     if price_match: hints["price"] = price_match.group(0)
+    
     rating_match = re.search(r"(?:⭐|rating[:\s]*)(\d+(?:\.\d+)?)", text, re.IGNORECASE)
     if rating_match: hints["rating"] = rating_match.group(1)
+    
     orders_match = re.search(r"(\d[\d.,]*\+?)\s*(?:orders|הזמנות|sold)", text, re.IGNORECASE)
     if orders_match: hints["orders"] = orders_match.group(1)
+    
     coupon_matches = re.findall(r"(?:קופון|coupon|code)[:\s]*([A-Za-z0-9-]+)", text, re.IGNORECASE)
     if coupon_matches: hints["coupons"] = ", ".join(dict.fromkeys(coupon_matches))
+    
     return hints
 
 
