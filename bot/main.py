@@ -52,27 +52,13 @@ def _float_env(
     try:
         value = float(raw)
     except ValueError:
-        print(
-            f"Warning: {name} must be a float; got {raw!r}. "
-            f"Falling back to default={default}",
-            flush=True,
-        )
+        print(f"Warning: {name} must be a float; got {raw!r}. Falling back to {default}")
         return default
 
     if min_value is not None and value < min_value:
-        print(
-            f"Warning: {name} must be >= {min_value}; got {value!r}. "
-            f"Falling back to default={default}",
-            flush=True,
-        )
         return default
 
     if value == 0 and not allow_zero:
-        print(
-            f"Warning: {name} must be positive; got 0. "
-            f"Falling back to default={default}",
-            flush=True,
-        )
         return default
 
     return value
@@ -110,7 +96,7 @@ class Config:
     def from_env(cls) -> "Config":
         tg_source_channels = [c.strip() for c in _require_env("TG_SOURCE_CHANNELS").split(",") if c.strip()]
         if not tg_source_channels:
-            raise RuntimeError("TG_SOURCE_CHANNELS is set but empty after parsing")
+            raise RuntimeError("TG_SOURCE_CHANNELS is set but empty")
 
         affiliate_api_endpoint = _optional_str("AFFILIATE_API_ENDPOINT")
         affiliate_portal_template = _optional_str("AFFILIATE_PORTAL_LINK")
@@ -119,9 +105,8 @@ class Config:
         affiliate_app_key = _optional_str("ALIEXPRESS_API_APP_KEY")
         affiliate_app_secret = _optional_str("ALIEXPRESS_API_APP_SECRET")
 
-        # Warn if no affiliate method is configured (but don't crash)
         if not (affiliate_api_endpoint or affiliate_portal_template or affiliate_prefix):
-            print("Warning: No affiliate method configured (API, Portal, or Prefix).")
+            print("Warning: No affiliate method configured.")
 
         return cls(
             tg_api_id=int(_require_env("TG_API_ID")),
@@ -132,7 +117,7 @@ class Config:
             affiliate_api_endpoint=affiliate_api_endpoint,
             affiliate_app_key=affiliate_app_key,
             affiliate_app_secret=affiliate_app_secret,
-            affiliate_api_timeout=_float_env("AFFILIATE_API_TIMEOUT", 5.0, min_value=1e-6),
+            affiliate_api_timeout=_float_env("AFFILIATE_API_TIMEOUT", 10.0, min_value=1.0),
             affiliate_portal_template=affiliate_portal_template,
             affiliate_prefix=affiliate_prefix,
             affiliate_prefix_encode=affiliate_prefix_encode,
@@ -153,23 +138,21 @@ def _canonical_url(url: str) -> str:
 
 def resolve_url_if_needed(url: str, timeout: float = 10.0) -> str:
     """
-    Expands shortened links (bit.ly, s.click) to get the real URL.
+    Expands shortened links (bit.ly, s.click) ONLY if necessary.
     """
     url = _canonical_url(url)
-    # Domains that MUST be resolved
-    triggers = ["s.click", "bit.ly", "a.aliexpress", "/share/", "short"]
+    # Only resolve if it looks like a shortener
+    triggers = ["bit.ly", "tinyurl.com", "goo.gl", "t.me"]
     
     if not any(t in url.lower() for t in triggers):
         return url
 
-    print(f"Resolving redirect for: {url}")
+    print(f"Resolving short link: {url}")
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             resp = client.get(url)
             if resp.url:
-                final = str(resp.url)
-                # Fix mobile links to desktop
-                return final.replace("m.aliexpress", "www.aliexpress")
+                return str(resp.url).replace("m.aliexpress", "www.aliexpress")
     except Exception as e:
         print(f"Error resolving URL: {e}")
     
@@ -177,19 +160,17 @@ def resolve_url_if_needed(url: str, timeout: float = 10.0) -> str:
 
 def extract_item_id_and_clean(url: str) -> str | None:
     """
-    Aggressive cleaner: Finds the ID and rebuilds a fresh URL.
-    Fixes the 'Homepage Redirect' issue.
+    Extracts the clean product URL (item/12345.html).
     """
     # 1. Try to find ID in the pattern /item/12345.html
     match = re.search(r"/item/(\d+)\.html", url)
     
-    # 2. If not found, look for simply numbers (fallback for some formats)
+    # 2. Fallback: look for 10+ digits
     if not match:
         match = re.search(r"(\d{10,})", url)
         
     if match:
         item_id = match.group(1)
-        # Return a sterile, perfect URL
         return f"https://www.aliexpress.com/item/{item_id}.html"
     
     return None
@@ -205,15 +186,16 @@ class AffiliateLinkBuilder:
     def _is_product_specific(self, url: str) -> bool:
         parsed = urlparse(url)
         path = parsed.path.lower()
-
-        if not parsed.netloc:
-            return False
-
+        if not parsed.netloc: return False
+        
+        # Valid affiliate link patterns
+        if "s.click.aliexpress.com" in parsed.netloc: return True
+        
+        # Valid product patterns
         product_markers = ["/item/", "/i/", "/share/"]
-        if any(marker in path for marker in product_markers):
-            return True
+        if any(marker in path for marker in product_markers): return True
 
-        return "star.aliexpress" in parsed.netloc.lower()
+        return False
 
     def _sign_params(self, params: Dict[str, str]) -> str:
         if not self.config.affiliate_app_secret: return ""
@@ -228,15 +210,18 @@ class AffiliateLinkBuilder:
 
         print(f"Requesting API link for: {clean_url}")
         timestamp = str(int(time.time() * 1000))
+        
+        # Using Standard/Advanced API parameters
         params = {
             "app_key": self.config.affiliate_app_key,
             "timestamp": timestamp,
             "sign_method": "md5",
             "urls": clean_url,
-            "promotion_link_type": "0", # 0 = Regular link, 2 = Hot link
-            "tracking_id": "default",   # You can change this if you have a specific tracking ID
+            "promotion_link_type": "0",  # 0=General, 2=Hot Link
+            "tracking_id": "default",    # Change this if you create a custom Tracking ID
             "format": "json",
-            "v": "2.0"
+            "v": "2.0",
+            "method": "aliexpress.affiliate.link.generate" # Explicit method name sometimes helps
         }
         params["sign"] = self._sign_params(params)
         
@@ -250,75 +235,69 @@ class AffiliateLinkBuilder:
                 resp.raise_for_status()
                 data = resp.json()
                 
-                # Check deep nested response
+                # Debug response structure if needed
+                # print(f"API Response: {data}")
+
                 if "aliexpress_affiliate_link_generate_response" in data:
                     result = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
                     promos = result.get("promotion_links", {}).get("promotion_link", [])
                     if promos:
-                        return promos[0].get("promotion_link") # This should be a s.click short link
-                else:
-                    print(f"API returned unexpected structure: {data}")
+                        aff_link = promos[0].get("promotion_link")
+                        print(f"API Success! Generated: {aff_link}")
+                        return aff_link
+                
+                # Check for error messages
+                if "error_response" in data:
+                    print(f"API Error Response: {data['error_response']}")
 
         except Exception as e:
-            print(f"API Error: {e}")
+            print(f"API Connection Error: {e}")
         
         return None
 
     def _from_portal_template(self, clean_url: str) -> str | None:
-        # Fallback: Creates a long link, but at least it works
-        if not self.config.affiliate_portal_template:
-            return None
-
+        if not self.config.affiliate_portal_template: return None
         encoded = quote(clean_url, safe="")
         template = self.config.affiliate_portal_template
-
         if "{url}" in template:
             return template.replace("{url}", encoded).strip()
-
-        # If no placeholder is present, the portal template cannot point to the specific product
-        print("Affiliate portal template missing {url} placeholder; falling back")
         return None
 
     def _from_prefix(self, clean_url: str) -> str | None:
-        if not self.config.affiliate_prefix:
-            return None
-
+        if not self.config.affiliate_prefix: return None
         if self.config.affiliate_prefix_encode:
             return f"{self.config.affiliate_prefix}{quote(clean_url, safe='')}".strip()
-
         return f"{self.config.affiliate_prefix}{clean_url}".strip()
 
     def build(self, original_url: str) -> str:
-        # Step 1: Resolve redirect if configured
-        if self.config.resolve_redirects:
-            current_url = resolve_url_if_needed(original_url, timeout=self.config.resolve_redirect_timeout)
+        # KEY FIX: Avoid scraping if it's already a product link
+        if "/item/" in original_url and "aliexpress.com" in original_url:
+             cleaned = extract_item_id_and_clean(original_url)
         else:
-            current_url = _canonical_url(original_url)
+             # Only resolve if it's a short link (bit.ly etc)
+             resolved = resolve_url_if_needed(original_url, timeout=self.config.resolve_redirect_timeout)
+             cleaned = extract_item_id_and_clean(resolved)
 
-        # Step 2: Clean and extract ID
-        cleaned = extract_item_id_and_clean(current_url)
-
-        # If cleaning failed (no ID found), use the resolved URL as best effort
         if not cleaned:
-            cleaned = current_url
+            cleaned = original_url
 
+        # Try API first
+        api_link = self._from_api(cleaned)
+        if api_link:
+            return api_link
+
+        # Try Portal/Prefix as backup
         candidates = [
-            ("API", self._from_api(cleaned)),
             ("portal template", self._from_portal_template(cleaned)),
             ("prefix", self._from_prefix(cleaned)),
         ]
 
         for source, link in candidates:
-            if not link:
-                continue
-
-            if self._is_product_specific(link):
+            if link and self._is_product_specific(link):
                 print(f"Using affiliate link from {source}")
                 return link
 
-            print(f"Ignoring {source} affiliate candidate that does not point to a specific product")
-
-        # Fallback: return the cleaned URL (no affiliate)
+        print("Failed to generate affiliate link. Using clean link.")
         return cleaned
 
 
@@ -328,16 +307,10 @@ class AffiliateLinkBuilder:
 
 def extract_fact_hints(text: str) -> Dict[str, str]:
     hints = {}
-    
     price_match = re.search(r"(₪|\$)\s?\d+[\d.,]*", text)
     if price_match: hints["price"] = price_match.group(0)
-    
     rating_match = re.search(r"(?:⭐|rating[:\s]*)(\d+(?:\.\d+)?)", text, re.IGNORECASE)
     if rating_match: hints["rating"] = rating_match.group(1)
-    
-    orders_match = re.search(r"(\d[\d.,]*\+?)\s*(?:orders|הזמנות|sold)", text, re.IGNORECASE)
-    if orders_match: hints["orders"] = orders_match.group(1)
-    
     return hints
 
 class CaptionWriter:
@@ -350,30 +323,31 @@ class CaptionWriter:
         hints_str = "\n".join([f"- {k}: {v}" for k, v in hints.items()])
         
         prompt = f"""
-תכתוב פוסט מכירה קצר לטלגרם.
-מוצר: {orig_text[:100]}...
-פרטים: {hints_str}
+תכתוב פוסט מכירה שיווקי וקצר לטלגרם בעברית.
+המוצר: {orig_text[:150]}...
+נתונים: {hints_str}
 
-הוראות:
-- כותרת קצרה עם אימוג'י.
-- 2 משפטים על למה זה שווה.
-- מחיר אם ידוע.
-- בלי האשטאגים.
-- אל תכתוב "קישור" או "לקנייה" - אני מוסיף לבד.
+הנחיות:
+- כותרת קליטה עם אימוג'י מתאים.
+- 2-3 משפטים קצרים למה המוצר שווה.
+- ציין מחיר אם מופיע בנתונים.
+- אל תוסיף האשטאגים.
+- אל תכתוב "לחצו כאן" או "לינק" בגוף הטקסט (אני מוסיף כפתור).
+- טון דיבור: המלצה לחבר, לא רובוטי.
 """
         try:
             res = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=300
+                max_tokens=350
             )
             if res.choices and res.choices[0].message.content:
                 return res.choices[0].message.content.strip()
-            return "דיל מעולה מאליאקספרס! שווה בדיקה 👇"
+            return "מצאתי דיל מעולה באליאקספרס! שווה להציץ 👇"
         except Exception as e:
             print(f"OpenAI Error: {e}")
-            return "דיל מעולה מאליאקספרס! שווה בדיקה 👇"
+            return "מצאתי דיל מעולה באליאקספרס! שווה להציץ 👇"
 
 # =======================
 # Main Bot Loop
@@ -391,63 +365,53 @@ class DealBot:
         print("Bot started...")
         for channel in self.config.tg_source_channels:
             print(f"Scanning {channel}...")
-            # Iterate over history
             try:
                 async for msg in self.client.iter_messages(channel, limit=self.config.max_messages_per_channel):
                     if not msg.message: continue
                     
-                    # Find links
+                    # Regex to capture URLs
                     urls = re.findall(r"https?://[^\s]+", msg.message)
-                    ali_urls = [u for u in urls if "aliexpress" in u.lower() or "bit.ly" in u.lower() or "s.click" in u.lower()]
+                    valid_urls = [u for u in urls if "aliexpress" in u.lower() or "bit.ly" in u.lower() or "s.click" in u.lower()]
                     
-                    if not ali_urls: continue
+                    if not valid_urls: continue
                     
-                    # Process first link found
-                    original_link = ali_urls[0]
-                    print(f"Found link: {original_link}")
+                    original_link = valid_urls[0]
+                    print(f"Found: {original_link}")
                     
-                    # GENERATE LINK
+                    # Generate Affiliate Link
                     affiliate_link = self.builder.build(original_link)
                     
-                    # Extract ID for deduplication
-                    # We use the affiliate link (which should be clean) to check ID, 
-                    # or fallback to hash if ID extraction fails.
+                    # Deduplication ID Logic
                     clean_check = extract_item_id_and_clean(affiliate_link) or affiliate_link
                     prod_id_match = re.search(r"(\d+)\.html", clean_check)
-                    
-                    if prod_id_match:
-                        pid = prod_id_match.group(1)
-                    else:
-                        # Fallback: hash the URL to avoid reposting same link in this run
-                        pid = str(hash(clean_check))
+                    pid = prod_id_match.group(1) if prod_id_match else str(hash(clean_check))
                     
                     if pid in self.processed_ids:
-                        print(f"Skipping duplicate ID: {pid}")
+                        print(f"Skipping duplicate: {pid}")
                         continue
                     
-                    # Generate Text
+                    # Generate Content
                     new_caption = self.writer.write(msg.message, affiliate_link)
                     final_msg = f"{new_caption}\n\n👇 לקנייה:\n{affiliate_link}\n\n(id:{pid})"
                     
-                    # Send
                     try:
                         if msg.media:
                             await self.client.send_file(self.config.tg_target_channel, msg.media, caption=final_msg)
                         else:
                             await self.client.send_message(self.config.tg_target_channel, final_msg)
                         
-                        print(f"Posted: {pid}")
+                        print(f"✅ Posted: {pid}")
                         self.processed_ids.add(pid)
                         
                         if len(self.processed_ids) >= self.config.max_posts_per_run:
-                            print("Max posts reached. Stopping.")
+                            print("Hit max posts limit. Done.")
                             return
                             
                     except Exception as e:
-                        print(f"Failed to send message: {e}")
-
+                        print(f"Failed to send: {e}")
+                        
             except Exception as e:
-                print(f"Error scanning channel {channel}: {e}")
+                print(f"Error scanning {channel}: {e}")
 
 async def main():
     try:
@@ -467,7 +431,7 @@ async def main():
             await bot.run()
             
     except Exception as e:
-        print(f"Critical Error in main: {e}")
+        print(f"Critical Startup Error: {e}")
         import traceback
         traceback.print_exc()
 
