@@ -139,6 +139,7 @@ class Config:
     affiliate_api_timeout: float
     affiliate_portal_template: str | None
     affiliate_prefix: str | None
+    affiliate_prefix_encode: bool
     
     openai_api_key: str
     openai_model: str
@@ -163,6 +164,7 @@ class Config:
         affiliate_api_endpoint = _optional_str("AFFILIATE_API_ENDPOINT")
         affiliate_portal_template = _optional_str("AFFILIATE_PORTAL_LINK")
         affiliate_prefix = _optional_str("AFFILIATE_PREFIX")
+        affiliate_prefix_encode = _bool_env("AFFILIATE_PREFIX_ENCODE", True)
         affiliate_app_key = _optional_str("ALIEXPRESS_API_APP_KEY")
         affiliate_app_secret = _optional_str("ALIEXPRESS_API_APP_SECRET")
 
@@ -182,6 +184,7 @@ class Config:
             affiliate_api_timeout=_float_env("AFFILIATE_API_TIMEOUT", 5.0, min_value=1e-6),
             affiliate_portal_template=affiliate_portal_template,
             affiliate_prefix=affiliate_prefix,
+            affiliate_prefix_encode=affiliate_prefix_encode,
             openai_api_key=_require_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
             min_views=_int_env("MIN_VIEWS", 1500, allow_zero=True, min_value=0),
@@ -296,6 +299,19 @@ class AffiliateLinkBuilder:
     def __init__(self, config: Config):
         self.config = config
 
+    def _is_product_specific(self, url: str) -> bool:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+
+        if not parsed.netloc:
+            return False
+
+        product_markers = ["/item/", "/i/", "/share/"]
+        if any(marker in path for marker in product_markers):
+            return True
+
+        return "star.aliexpress" in parsed.netloc.lower()
+
     def _sign_params(self, params: Dict[str, str]) -> str:
         if not self.config.affiliate_app_secret:
             return ""
@@ -351,27 +367,45 @@ class AffiliateLinkBuilder:
     def _from_portal_template(self, clean_url: str) -> str | None:
         if not self.config.affiliate_portal_template:
             return None
-        
+
         encoded = quote(clean_url, safe="")
         template = self.config.affiliate_portal_template
-        
+
         if "{url}" in template:
             return template.replace("{url}", encoded).strip()
-        return template.strip()
+
+        # If no placeholder is present, the portal template cannot point to the specific product
+        print("Affiliate portal template missing {url} placeholder; falling back")
+        return None
+
+    def _from_prefix(self, clean_url: str) -> str | None:
+        if not self.config.affiliate_prefix:
+            return None
+
+        if self.config.affiliate_prefix_encode:
+            return f"{self.config.affiliate_prefix}{quote(clean_url, safe='')}".strip()
+
+        return f"{self.config.affiliate_prefix}{clean_url}".strip()
 
     def build(self, original_url: str) -> str:
         resolved = resolve_final_url(original_url, enabled=self.config.resolve_redirects, timeout_seconds=self.config.resolve_redirect_timeout)
         cleaned = clean_product_url(resolved)
-        
-        api_link = self._from_api(cleaned)
-        if api_link:
-            print(f"Using affiliate link from API")
-            return api_link
 
-        portal_link = self._from_portal_template(cleaned)
-        if portal_link:
-            print(f"Using affiliate link from portal template")
-            return portal_link
+        candidates = [
+            ("API", self._from_api(cleaned)),
+            ("portal template", self._from_portal_template(cleaned)),
+            ("prefix", self._from_prefix(cleaned)),
+        ]
+
+        for source, link in candidates:
+            if not link:
+                continue
+
+            if self._is_product_specific(link):
+                print(f"Using affiliate link from {source}")
+                return link
+
+            print(f"Ignoring {source} affiliate candidate that does not point to a specific product")
 
         return cleaned
 
@@ -387,7 +421,6 @@ def extract_fact_hints(text: str) -> Dict[str, str]:
     if price_match: hints["price"] = price_match.group(0)
     rating_match = re.search(r"(?:⭐|rating[:\s]*)(\d+(?:\.\d+)?)", text, re.IGNORECASE)
     if rating_match: hints["rating"] = rating_match.group(1)
-    orders_match
     orders_match = re.search(r"(\d[\d.,]*\+?)\s*(?:orders|הזמנות|sold)", text, re.IGNORECASE)
     if orders_match: hints["orders"] = orders_match.group(1)
     coupon_matches = re.findall(r"(?:קופון|coupon|code)[:\s]*([A-Za-z0-9-]+)", text, re.IGNORECASE)
