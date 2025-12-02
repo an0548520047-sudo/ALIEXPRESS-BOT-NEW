@@ -42,6 +42,49 @@ def _float_env(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
     except ValueError:
+        print(
+            f"Warning: {name} must be an integer; got {raw!r}. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    if min_value is not None and value < min_value:
+        print(
+            f"Warning: {name} must be >= {min_value}; got {value!r}. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    if value == 0 and not allow_zero:
+        print(
+            f"Warning: {name} must be positive; got 0. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    return value
+
+
+def _float_env(
+    name: str,
+    default: float,
+    *,
+    allow_zero: bool = False,
+    min_value: float | None = None,
+    **extra: object,
+) -> float:
+    if extra:
+        print(
+            f"Warning: {_float_env.__name__} received unexpected keyword args {list(extra.keys())}. "
+            "They will be ignored.",
+            flush=True,
+        )
+
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
         return default
 
 def _int_env(name: str, default: int) -> int:
