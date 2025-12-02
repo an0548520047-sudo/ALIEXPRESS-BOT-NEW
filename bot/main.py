@@ -102,11 +102,14 @@ class Config:
         affiliate_portal_template = _optional_str("AFFILIATE_PORTAL_LINK")
         affiliate_prefix = _optional_str("AFFILIATE_PREFIX")
         affiliate_prefix_encode = _bool_env("AFFILIATE_PREFIX_ENCODE", True)
-        affiliate_app_key = _optional_str("ALIEXPRESS_API_APP_KEY")
-        affiliate_app_secret = _optional_str("ALIEXPRESS_API_APP_SECRET")
+        
+        # Support both variable names for Key/Secret to avoid confusion
+        affiliate_app_key = _optional_str("ALIEXPRESS_API_APP_KEY") or _optional_str("AFFILIATE_APP_KEY")
+        # Check both standard secret name and the one in your YAML
+        affiliate_app_secret = _optional_str("ALIEXPRESS_API_APP_SECRET") or _optional_str("AFFILIATE_API_TOKEN")
 
-        if not (affiliate_api_endpoint or affiliate_portal_template or affiliate_prefix):
-            print("Warning: No affiliate method configured.")
+        if not (affiliate_api_endpoint and affiliate_app_key and affiliate_app_secret):
+            print("Warning: API credentials missing. Affiliate links might fail.")
 
         return cls(
             tg_api_id=int(_require_env("TG_API_ID")),
@@ -183,20 +186,6 @@ class AffiliateLinkBuilder:
     def __init__(self, config: Config):
         self.config = config
 
-    def _is_product_specific(self, url: str) -> bool:
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        if not parsed.netloc: return False
-        
-        # Valid affiliate link patterns
-        if "s.click.aliexpress.com" in parsed.netloc: return True
-        
-        # Valid product patterns
-        product_markers = ["/item/", "/i/", "/share/"]
-        if any(marker in path for marker in product_markers): return True
-
-        return False
-
     def _sign_params(self, params: Dict[str, str]) -> str:
         if not self.config.affiliate_app_secret: return ""
         sorted_keys = sorted(params.keys())
@@ -206,6 +195,7 @@ class AffiliateLinkBuilder:
 
     def _from_api(self, clean_url: str) -> str | None:
         if not self.config.affiliate_api_endpoint or not self.config.affiliate_app_key:
+            print("API credentials missing inside _from_api")
             return None
 
         print(f"Requesting API link for: {clean_url}")
@@ -244,8 +234,7 @@ class AffiliateLinkBuilder:
                         
                         if promos:
                             aff_link = promos[0].get("promotion_link")
-                            
-                            # Check if the link is valid and specific
+                            # Validation: ensure it's an s.click link
                             if aff_link and "s.click" in aff_link:
                                 print(f"API Success (Type {l_type})! Generated: {aff_link}")
                                 return aff_link
@@ -256,54 +245,26 @@ class AffiliateLinkBuilder:
         print("API failed to generate a specific product link.")
         return None
 
-    def _from_portal_template(self, clean_url: str) -> str | None:
-        if not self.config.affiliate_portal_template: return None
-        encoded = quote(clean_url, safe="")
-        template = self.config.affiliate_portal_template
-        if "{url}" in template:
-            return template.replace("{url}", encoded).strip()
-        return None
-
-    def _from_prefix(self, clean_url: str) -> str | None:
-        if not self.config.affiliate_prefix: return None
-        if self.config.affiliate_prefix_encode:
-            return f"{self.config.affiliate_prefix}{quote(clean_url, safe='')}".strip()
-        return f"{self.config.affiliate_prefix}{clean_url}".strip()
-
     def build(self, original_url: str) -> str:
-        # KEY LOGIC:
-        # 1. If it's already a product URL, DO NOT scrape/resolve it (avoids captcha).
-        # 2. If it's a short URL, try to resolve it.
-        
+        # STRICT MODE:
+        # 1. Clean the URL (no scraping if possible)
         if "/item/" in original_url and "aliexpress.com" in original_url:
-             # It's a direct link, just clean the ID
              cleaned = extract_item_id_and_clean(original_url)
         else:
-             # It's a short link, resolve it
              resolved = resolve_url_if_needed(original_url, timeout=self.config.resolve_redirect_timeout)
              cleaned = extract_item_id_and_clean(resolved)
 
-        # Fallback if cleaning failed
         if not cleaned:
             cleaned = original_url
 
-        # Try API first
+        # 2. Try API ONLY
         api_link = self._from_api(cleaned)
+        
         if api_link:
             return api_link
 
-        # Try Portal/Prefix as backup
-        candidates = [
-            ("portal template", self._from_portal_template(cleaned)),
-            ("prefix", self._from_prefix(cleaned)),
-        ]
-
-        for source, link in candidates:
-            if link and self._is_product_specific(link):
-                print(f"Using affiliate link from {source}")
-                return link
-
-        print("Failed to generate affiliate link. Using clean link.")
+        # 3. Fallback: Return CLEAN URL (Not Homepage!)
+        print(f"⚠️ Affiliate generation failed. Using standard product link: {cleaned}")
         return cleaned
 
 
