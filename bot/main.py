@@ -142,7 +142,7 @@ def resolve_url_if_needed(url: str, timeout: float = 10.0) -> str:
     """
     url = _canonical_url(url)
     # Only resolve if it looks like a shortener
-    triggers = ["bit.ly", "tinyurl.com", "goo.gl", "t.me"]
+    triggers = ["bit.ly", "tinyurl.com", "goo.gl", "t.me", "s.click"]
     
     if not any(t in url.lower() for t in triggers):
         return url
@@ -211,48 +211,49 @@ class AffiliateLinkBuilder:
         print(f"Requesting API link for: {clean_url}")
         timestamp = str(int(time.time() * 1000))
         
-        # Using Standard/Advanced API parameters
-        params = {
-            "app_key": self.config.affiliate_app_key,
-            "timestamp": timestamp,
-            "sign_method": "md5",
-            "urls": clean_url,
-            "promotion_link_type": "0",  # 0=General, 2=Hot Link
-            "tracking_id": "default",    # Change this if you create a custom Tracking ID
-            "format": "json",
-            "v": "2.0",
-            "method": "aliexpress.affiliate.link.generate" # Explicit method name sometimes helps
-        }
-        params["sign"] = self._sign_params(params)
+        # Try both Hot Link (2) and General Link (0)
+        link_types = ["2", "0"]
         
-        try:
-            with httpx.Client(timeout=self.config.affiliate_api_timeout) as client:
-                resp = client.post(
-                    self.config.affiliate_api_endpoint, 
-                    data=params, 
-                    headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                
-                # Debug response structure if needed
-                # print(f"API Response: {data}")
-
-                if "aliexpress_affiliate_link_generate_response" in data:
-                    result = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
-                    promos = result.get("promotion_links", {}).get("promotion_link", [])
-                    if promos:
-                        aff_link = promos[0].get("promotion_link")
-                        print(f"API Success! Generated: {aff_link}")
-                        return aff_link
-                
-                # Check for error messages
-                if "error_response" in data:
-                    print(f"API Error Response: {data['error_response']}")
-
-        except Exception as e:
-            print(f"API Connection Error: {e}")
+        for l_type in link_types:
+            params = {
+                "app_key": self.config.affiliate_app_key,
+                "timestamp": timestamp,
+                "sign_method": "md5",
+                "urls": clean_url,
+                "promotion_link_type": l_type,
+                "tracking_id": "default",
+                "format": "json",
+                "v": "2.0",
+                "method": "aliexpress.affiliate.link.generate"
+            }
+            params["sign"] = self._sign_params(params)
+            
+            try:
+                with httpx.Client(timeout=self.config.affiliate_api_timeout) as client:
+                    resp = client.post(
+                        self.config.affiliate_api_endpoint, 
+                        data=params, 
+                        headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    if "aliexpress_affiliate_link_generate_response" in data:
+                        result = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
+                        promos = result.get("promotion_links", {}).get("promotion_link", [])
+                        
+                        if promos:
+                            aff_link = promos[0].get("promotion_link")
+                            
+                            # Check if the link is valid and specific
+                            if aff_link and "s.click" in aff_link:
+                                print(f"API Success (Type {l_type})! Generated: {aff_link}")
+                                return aff_link
+                                
+            except Exception as e:
+                print(f"API attempt (Type {l_type}) failed: {e}")
         
+        print("API failed to generate a specific product link.")
         return None
 
     def _from_portal_template(self, clean_url: str) -> str | None:
@@ -270,14 +271,19 @@ class AffiliateLinkBuilder:
         return f"{self.config.affiliate_prefix}{clean_url}".strip()
 
     def build(self, original_url: str) -> str:
-        # KEY FIX: Avoid scraping if it's already a product link
+        # KEY LOGIC:
+        # 1. If it's already a product URL, DO NOT scrape/resolve it (avoids captcha).
+        # 2. If it's a short URL, try to resolve it.
+        
         if "/item/" in original_url and "aliexpress.com" in original_url:
+             # It's a direct link, just clean the ID
              cleaned = extract_item_id_and_clean(original_url)
         else:
-             # Only resolve if it's a short link (bit.ly etc)
+             # It's a short link, resolve it
              resolved = resolve_url_if_needed(original_url, timeout=self.config.resolve_redirect_timeout)
              cleaned = extract_item_id_and_clean(resolved)
 
+        # Fallback if cleaning failed
         if not cleaned:
             cleaned = original_url
 
