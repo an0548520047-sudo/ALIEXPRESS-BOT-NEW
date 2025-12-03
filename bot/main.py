@@ -7,7 +7,6 @@ import time
 import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Set
-from urllib.parse import quote
 
 import httpx
 from openai import OpenAI
@@ -15,16 +14,13 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 HISTORY_FILE = "history.txt"
+MAX_HISTORY_SIZE = 200  # זוכר רק את ה-200 האחרונים
 
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value or not value.strip():
         raise RuntimeError(f"Missing: {name}")
     return value.strip()
-
-def _bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    return raw and raw.strip().lower() in {"1", "true", "yes", "on"} if raw else default
 
 def _optional_str(name: str) -> str | None:
     raw = os.getenv(name)
@@ -82,7 +78,6 @@ class Config:
         )
 
 def resolve_short_link(url: str, timeout: float = 8.0) -> str:
-    """Resolve s.click or bit.ly links to get final URL"""
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             resp = client.head(url, follow_redirects=True)
@@ -91,7 +86,6 @@ def resolve_short_link(url: str, timeout: float = 8.0) -> str:
         return url
 
 def extract_item_id(url: str) -> str | None:
-    """Extract product ID from AliExpress URL"""
     match = re.search(r"/item/(\d+)\.html", url)
     if match:
         return match.group(1)
@@ -103,8 +97,7 @@ class AffiliateLinkBuilder:
         self.config = config
 
     def _sign_params(self, params: Dict[str, str]) -> str:
-        if not self.config.affiliate_app_secret:
-            return ""
+        if not self.config.affiliate_app_secret: return ""
         sorted_keys = sorted(params.keys())
         param_str = "".join([f"{key}{params[key]}" for key in sorted_keys])
         sign_source = f"{self.config.affiliate_app_secret}{param_str}{self.config.affiliate_app_secret}"
@@ -137,31 +130,36 @@ class AffiliateLinkBuilder:
                     data = resp.json()
 
                     if "aliexpress_affiliate_link_generate_response" in data:
-                        result = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get(
-                            "result", {})
+                        result = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
                         promos = result.get("promotion_links", {}).get("promotion_link", [])
                         if promos:
                             aff_link = promos[0].get("promotion_link")
                             if aff_link and "s.click" in aff_link:
-                                print(f"✅ API: {aff_link}")
+                                print(f"✅ API Generated: {aff_link}")
                                 return aff_link
             except Exception as e:
-                print(f"API error: {e}")
+                print(f"API Error ({l_type}): {e}")
         return None
 
     def build(self, original_url: str) -> str:
-        # If it's a short link, resolve it first
+        # 1. Resolve short link (for ID extraction AND for API)
         if "s.click" in original_url or "bit.ly" in original_url:
             resolved = resolve_short_link(original_url)
         else:
             resolved = original_url
 
-        # Try API
+        # 2. Try API with the RESOLVED link (most reliable)
         api_link = self._from_api(resolved)
         if api_link:
             return api_link
+            
+        # 3. If failed, try API with the original link (sometimes works better)
+        if resolved != original_url:
+            api_link = self._from_api(original_url)
+            if api_link:
+                return api_link
 
-        # Fallback to clean link
+        # 4. Fallback: Clean link (No affiliate)
         item_id = extract_item_id(resolved)
         if item_id:
             return f"https://www.aliexpress.com/item/{item_id}.html"
@@ -190,19 +188,22 @@ class DealBot:
         self.writer = writer
         self.builder = builder
         self.config = config
-        self.processed_ids: Set[str] = set()
+        # משתמשים ב-List במקום Set כדי לשמור על סדר הכנסה (FIFO)
+        self.processed_ids: List[str] = []
 
     def load_history(self):
-        """Load IDs from history file"""
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "r") as f:
-                self.processed_ids = {line.strip() for line in f if line.strip()}
+                # טוען ושומר רק את ה-200 האחרונים
+                lines = [line.strip() for line in f if line.strip()]
+                self.processed_ids = lines[-MAX_HISTORY_SIZE:]
             print(f"📚 Loaded {len(self.processed_ids)} products from history")
 
     def save_history(self):
-        """Save IDs to history file"""
+        # שומר רק את ה-200 האחרונים לקובץ
+        recent_ids = self.processed_ids[-MAX_HISTORY_SIZE:]
         with open(HISTORY_FILE, "w") as f:
-            f.write("\n".join(sorted(self.processed_ids)))
+            f.write("\n".join(recent_ids))
 
     async def run(self):
         self.load_history()
@@ -213,31 +214,28 @@ class DealBot:
             try:
                 count = 0
                 async for msg in self.client.iter_messages(channel, limit=self.config.max_messages_per_channel):
-                    if not msg.message:
-                        continue
+                    if not msg.message: continue
 
                     urls = re.findall(r"https?://[^\s]+", msg.message)
                     ali_urls = [u for u in urls if "aliexpress" in u.lower() or "bit.ly" in u.lower() or "s.click" in u.lower()]
-                    if not ali_urls:
-                        continue
+                    if not ali_urls: continue
 
                     link = ali_urls[0]
 
-                    # Resolve to get real ID
+                    # Resolve to get real ID for checking duplication
                     if "s.click" in link or "bit.ly" in link:
                         resolved = resolve_short_link(link)
                     else:
                         resolved = link
 
                     item_id = extract_item_id(resolved)
-                    if not item_id:
-                        print(f"⚠️ No ID found: {link}")
-                        continue
+                    if not item_id: continue
 
                     if item_id in self.processed_ids:
-                        print(f"⏭️ Duplicate: {item_id}")
+                        print(f"⏭️ Duplicate (in last {MAX_HISTORY_SIZE}): {item_id}")
                         continue
 
+                    # Build affiliate link
                     final_link = self.builder.build(link)
                     caption = self.writer.write(msg.message)
                     text = f"{caption}\n\n👇 {final_link}"
@@ -249,7 +247,14 @@ class DealBot:
                             await self.client.send_message(self.config.tg_target_channel, text)
 
                         print(f"✅ Posted: {item_id}")
-                        self.processed_ids.add(item_id)
+                        
+                        # מוסיף לרשימה (בסוף)
+                        self.processed_ids.append(item_id)
+                        
+                        # אם הרשימה גדולה מדי, מוחק את הישן ביותר (בהתחלה)
+                        if len(self.processed_ids) > MAX_HISTORY_SIZE:
+                            self.processed_ids.pop(0)
+                            
                         count += 1
 
                         if count >= self.config.max_posts_per_run:
