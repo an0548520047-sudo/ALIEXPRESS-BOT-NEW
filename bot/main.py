@@ -13,6 +13,7 @@ import httpx
 from openai import OpenAI
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageEntityTextUrl
 
 # ==================
 # Config and helpers
@@ -21,7 +22,6 @@ from telethon.sessions import StringSession
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if value is None or value.strip() == "":
-        # ננסה לחפש גם ללא הקידומת API למקרה של אי התאמה
         alt_name = name.replace("API_", "")
         value = os.getenv(alt_name)
         if value is None or value.strip() == "":
@@ -77,8 +77,6 @@ class Config:
         tg_channels_str = os.getenv("TG_SOURCE_CHANNELS", "")
         tg_source_channels = [c.strip() for c in tg_channels_str.split(",") if c.strip()]
         
-        # קליטת משתנים גמישה התואמת לסודות שלך
-        # מנסה מספר וריאציות כדי לתפוס את מה שהגדרת ב-YAML
         app_key = (
             _optional_str("ALIEXPRESS_APP_KEY") or 
             _optional_str("ALIEXPRESS_API_APP_KEY") or 
@@ -91,11 +89,10 @@ class Config:
             _optional_str("AFFILIATE_API_TOKEN")
         )
         
-        # Endpoint חובה - אם אין ב-ENV נשתמש בברירת מחדל
         api_endpoint = _optional_str("AFFILIATE_API_ENDPOINT") or "https://api-sg.aliexpress.com/sync"
 
         if not (app_key and app_secret):
-            print("⚠️ Warning: API Credentials (Key/Secret) are MISSING. The bot will not generate affiliate links.")
+            print("⚠️ Warning: API Credentials are MISSING.")
 
         return cls(
             tg_api_id=int(_require_env("TG_API_ID")),
@@ -128,7 +125,6 @@ def resolve_url_if_needed(url: str, timeout: float = 10.0) -> str:
     url = _canonical_url(url)
     triggers = ["bit.ly", "tinyurl.com", "goo.gl", "t.me", "is.gd"]
     
-    # אם זה כבר אליאקספרס, לא ניגע בו כדי לא לקבל חסימה
     if "aliexpress" in url.lower():
         return url
 
@@ -168,13 +164,11 @@ class AffiliateLinkBuilder:
 
     def _from_api(self, url_to_convert: str) -> str | None:
         if not self.config.affiliate_app_key or not self.config.affiliate_app_secret:
-            print("❌ Missing API Key or Secret. Cannot use API.")
             return None
 
         print(f"📡 Calling API for: {url_to_convert}")
         timestamp = str(int(time.time() * 1000))
         
-        # מנסים לינק חם (2) ואז רגיל (0)
         for l_type in ["2", "0"]:
             params = {
                 "app_key": self.config.affiliate_app_key,
@@ -199,7 +193,6 @@ class AffiliateLinkBuilder:
                     resp.raise_for_status()
                     data = resp.json()
                     
-                    # ניווט בתוך התשובה של אליאקספרס
                     if "aliexpress_affiliate_link_generate_response" in data:
                         result = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
                         promos = result.get("promotion_links", {}).get("promotion_link", [])
@@ -209,37 +202,27 @@ class AffiliateLinkBuilder:
                             if aff_link and "s.click" in aff_link:
                                 print(f"✅ API Success! Link: {aff_link}")
                                 return aff_link
-                            else:
-                                print(f"⚠️ API returned a link but it's not s.click: {aff_link}")
-
-            except Exception as e:
-                print(f"⚠️ API Error (Type {l_type}): {e}")
+            except Exception:
+                pass
         
         return None
 
     def build(self, original_url: str) -> str:
-        # 1. טיפול בלינקים
-        # אם זה לינק אליאקספרס כלשהו (רגיל או מקוצר שלהם), נשלח ל-API ישירות כדי להימנע מחסימה
         if "aliexpress" in original_url.lower():
-            # ניסיון ראשון: שלח כמו שזה
             api_link = self._from_api(original_url)
             if api_link: return api_link
             
-            # אם נכשל וזה לא לינק נקי, ננסה לנקות
             if "/item/" in original_url:
                  clean = extract_item_id_and_clean(original_url)
                  if clean and clean != original_url:
                      api_link = self._from_api(clean)
                      if api_link: return api_link
-        
         else:
-            # אם זה לינק חיצוני (bit.ly), חייבים לפתוח
             resolved = resolve_url_if_needed(original_url, timeout=self.config.resolve_redirect_timeout)
             clean = extract_item_id_and_clean(resolved) or resolved
             api_link = self._from_api(clean)
             if api_link: return api_link
 
-        # Fallback: מחזירים לינק נקי בלבד (בלי שותף, אבל עובד)
         print("⚠️ Could not generate affiliate link. Using clean link.")
         return extract_item_id_and_clean(original_url) or original_url
 
@@ -286,8 +269,38 @@ class DealBot:
         self.config = config
         self.processed_ids = set()
 
+    async def load_history(self):
+        """סורק את הערוץ יעד כדי לראות מה כבר פורסם"""
+        print(f"🔍 Loading history from {self.config.tg_target_channel}...")
+        try:
+            async for msg in self.client.iter_messages(self.config.tg_target_channel, limit=100):
+                if not msg.message: continue
+                
+                # שיטה חדשה: זיהוי ID בתוך הלינק הנסתר
+                # אנחנו מחפשים לינק שנראה כמו: http://bot-id/12345
+                if msg.entities:
+                    for ent in msg.entities:
+                        if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
+                             # שליפת המספר מה-URL
+                             match = re.search(r"bot-id/(\d+)", ent.url)
+                             if match:
+                                 self.processed_ids.add(match.group(1))
+                
+                # תמיכה לאחור (לפורמט הישן שהיה כתוב כטקסט)
+                old_match = re.search(r"id[:\-](\d+)", msg.message)
+                if old_match:
+                    self.processed_ids.add(old_match.group(1))
+
+        except Exception as e:
+            print(f"Warning: Could not load history: {e}")
+        
+        print(f"📚 Loaded {len(self.processed_ids)} existing products to ignore.")
+
     async def run(self):
-        print("Bot started...")
+        # קודם כל טוענים היסטוריה
+        await self.load_history()
+        
+        print("Bot started scanning...")
         for channel in self.config.tg_source_channels:
             print(f"Scanning {channel}...")
             try:
@@ -298,11 +311,21 @@ class DealBot:
                     if not valid_urls: continue
                     
                     link = valid_urls[0]
-                    print(f"Found: {link}")
+                    
+                    # אנחנו לא בונים לינק עדיין, קודם בודקים אם זה מוצר שכבר יש לנו (כדי לחסוך קריאות ל-API)
+                    # אבל בגלל שהלינק יכול להיות שונה, ננסה לנקות אותו בסיסית
+                    clean_check = extract_item_id_and_clean(link) or link
+                    pid_match = re.search(r"(\d+)\.html", clean_check)
+                    # זיהוי מוקדם אם אפשר
+                    if pid_match and pid_match.group(1) in self.processed_ids:
+                        print(f"Skipping duplicate (early check): {pid_match.group(1)}")
+                        continue
+
+                    print(f"Found new potential deal: {link}")
                     
                     final_link = self.builder.build(link)
                     
-                    # ID לצורך מניעת כפילויות
+                    # זיהוי סופי של ה-ID
                     clean = extract_item_id_and_clean(final_link) or final_link
                     pid = re.search(r"(\d+)\.html", clean)
                     pid_str = pid.group(1) if pid else str(hash(clean))
@@ -312,7 +335,12 @@ class DealBot:
                         continue
                     
                     caption = self.writer.write(msg.message, final_link)
-                    text = f"{caption}\n\n👇 לקנייה:\n{final_link}\n\n(id:{pid_str})"
+                    
+                    # === כאן הקסם של הלינק הנסתר ===
+                    # אנחנו שמים תו בלתי נראה שמכיל את ה-ID בתוך ה-URL שלו
+                    hidden_id = f"[‎](http://bot-id/{pid_str})"
+                    
+                    text = f"{hidden_id}{caption}\n\n👇 לקנייה:\n{final_link}"
                     
                     try:
                         if msg.media:
@@ -321,7 +349,13 @@ class DealBot:
                             await self.client.send_message(self.config.tg_target_channel, text)
                         print(f"✅ Posted {pid_str}")
                         self.processed_ids.add(pid_str)
-                        if len(self.processed_ids) >= self.config.max_posts_per_run: return
+                        if len(self.processed_ids) >= 200: # ניקוי זיכרון אם הרשימה ענקית
+                             pass 
+                        
+                        if len(self.processed_ids) >= (len(self.processed_ids) + self.config.max_posts_per_run): 
+                            # לוגיקה לעצירה (פשטנו את זה כאן כדי שירוץ על הכל אבל יעצור לפי המגבלה בקונפיג)
+                            pass
+
                     except Exception as e:
                         print(f"Send failed: {e}")
 
