@@ -23,7 +23,6 @@ from telethon.tl.types import MessageEntityTextUrl
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value or not value.strip():
-        # Fallback to alternative names
         alt = name.replace("API_", "")
         value = os.getenv(alt) or os.getenv(name.replace("ALIEXPRESS_", "AFFILIATE_"))
         if not value or not value.strip():
@@ -75,7 +74,6 @@ class Config:
 # =======================
 
 def resolve_url_smart(url: str) -> str:
-    """Resolves short links (bit.ly etc.) to real AliExpress URLs."""
     if "aliexpress" in url and "s.click" not in url:
         return url
     try:
@@ -86,7 +84,6 @@ def resolve_url_smart(url: str) -> str:
         return url
 
 def extract_item_id(url: str) -> str | None:
-    """Extracts numeric Item ID from URL."""
     match = re.search(r"/item/(\d+)\.html", url)
     if match: return match.group(1)
     match = re.search(r"(\d{10,})", url)
@@ -99,7 +96,6 @@ def extract_item_id(url: str) -> str | None:
 class AliExpressAPI:
     def __init__(self, config: Config):
         self.config = config
-        # Correct Endpoint for stable API usage
         self.base_url = "https://api-sg.aliexpress.com/router/rest"
 
     def _sign(self, params: Dict[str, str]) -> str:
@@ -109,7 +105,6 @@ class AliExpressAPI:
 
     def get_product_details(self, item_id: str) -> Dict | None:
         print(f"🔍 Checking quality for item: {item_id}")
-        # Timestamp format required by router/rest
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         params = {
@@ -147,7 +142,7 @@ class AliExpressAPI:
 
                 response_root = data.get("aliexpress_affiliate_product_detail_get_response")
                 if not response_root:
-                    print(f"⚠️ Unexpected JSON structure: {list(data.keys())}")
+                    print(f"⚠️ Unexpected JSON structure")
                     return None
 
                 resp_result = response_root.get("resp_result", {})
@@ -201,7 +196,7 @@ class AliExpressAPI:
                     if "promotion_links" in res and res["promotion_links"]["promotion_link"]:
                         return res["promotion_links"]["promotion_link"][0]["promotion_link"]
                 else:
-                    print(f"⚠️ Link Gen Structure Mismatch: {data}")
+                    print(f"⚠️ Link Gen Structure Mismatch")
                      
         except Exception as e:
             print(f"⚠️ API Link Gen Exception: {e}")
@@ -217,13 +212,40 @@ class Copywriter:
         self.model = model
 
     def write_post(self, original_text: str, price: str = "") -> str:
-        prompt = f"""
-אתה קופירייטר ישראלי מומחה לשיווק בטלגרם.
-המטרה: לכתוב פוסט קצר, דחוף ואנרגטי שגורם לאנשים להקליק ולקנות מיד.
-המוצר מתואר בטקסט המקור: "{original_text[:300]}"
-מחיר (אם ידוע): {price}
+        # Fixed prompt string to avoid syntax errors
+        prompt = (
+            "אתה קופירייטר ישראלי מומחה לשיווק בטלגרם.\n"
+            "המטרה: לכתוב פוסט קצר, דחוף ואנרגטי שגורם לאנשים להקליק ולקנות מיד.\n"
+            f"המוצר מתואר בטקסט המקור: \"{original_text[:300]}\"\n"
+            f"מחיר (אם ידוע): {price}\n\n"
+            "הנחיות:\n"
+            "1. כותרת חזקה עם אימוג'י (למשל: הלם 😱, מחיר הזיה 📉, חוטפים את זה 🔥).\n"
+            "2. גוף הטקסט: 2-3 משפטים קצרים בסלנג ישראלי טבעי ('תקשיבו זה מטורף', 'אל תפספסו').\n"
+            "3. בלי האשטאגים. בלי 'שלום לכולם'. ישר ולעניין.\n"
+            "4. תדגיש את המחיר אם הוא זול."
+        )
+        try:
+            res = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.8,
+                max_tokens=250
+            )
+            return res.choices[0].message.content.strip()
+        except:
+            return "דיל מטורף מאליאקספרס! אל תפספסו את המחיר הזה 🔥👇"
 
-הנחיות:
-1. כותרת חזקה עם אימוג'י (למשל: הלם 😱, מחיר הזיה 📉, חוטפים את זה 🔥).
-2. גוף הטקסט: 2-3 משפטים קצרים בסלנג ישראלי טבעי ("תקשיבו זה מטורף", "אל תפספסו").
-3. בלי האשטאגים. בלי
+# =======================
+# Main Bot Logic
+# =======================
+
+class DealBot:
+    def __init__(self, client: TelegramClient, ali_api: AliExpressAPI, copywriter: Copywriter, config: Config):
+        self.client = client
+        self.ali = ali_api
+        self.writer = copywriter
+        self.config = config
+        self.processed_ids = set()
+
+    async def load_history(self):
+        print(f"📚 Scanning last {self.config.max_messages_per_channel} messages
