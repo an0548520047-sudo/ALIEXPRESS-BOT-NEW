@@ -23,11 +23,9 @@ from telethon.tl.types import MessageEntityTextUrl
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value or not value.strip():
-        # ניסיון לשמות חלופיים נפוצים
         alt = name.replace("API_", "")
         value = os.getenv(alt) or os.getenv(name.replace("ALIEXPRESS_", "AFFILIATE_"))
         if not value or not value.strip():
-            # אם זה משהו קריטי נזרוק שגיאה, אחרת נחזיר ריק (למשל פורטל)
             if "APP_KEY" in name or "SESSION" in name or "HASH" in name:
                 raise RuntimeError(f"Missing required env: {name}")
             return ""
@@ -94,33 +92,35 @@ def extract_item_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 # =======================
-# AliExpress API Class (DEBUG VERSION)
+# AliExpress API Class (Taobao Router Fix)
 # =======================
 
 class AliExpressAPI:
     def __init__(self, config: Config):
         self.config = config
-        # נקודת קצה גלובלית - יציבה יותר
-        self.base_url = "https://api-sg.aliexpress.com/sync"
+        # שינוי קריטי: מעבר לשרת Taobao שהוא היציב ביותר
+        self.base_url = "https://api.taobao.com/router/rest"
 
     def _sign(self, params: Dict[str, str]) -> str:
-        # יצירת חתימה לפי הפרוטוקול של עליאקספרס
+        # החתימה נשארת זהה: Secret + Params + Secret
         s = "".join([f"{k}{params[k]}" for k in sorted(params.keys())])
         s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
         return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
     def get_product_details(self, item_id: str) -> Dict | None:
-        """בודק דירוג, הזמנות ומשיג תמונה נקייה. כולל הדפסת שגיאות מפורטת."""
         print(f"🔍 Checking quality for item: {item_id}")
+        # שינוי קריטי 2: שינוי פורמט הזמן ל-YYYY-MM-DD HH:MM:SS
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         params = {
             "app_key": self.config.affiliate_app_key,
-            "timestamp": str(int(time.time() * 1000)),
+            "timestamp": current_time,
             "sign_method": "md5",
             "method": "aliexpress.affiliate.product.detail.get",
             "product_ids": item_id,
             "target_currency": "ILS",
             "target_language": "HE",
-            "tracking_id": "bot_debug_check",
+            "tracking_id": "bot_quality_check",
             "format": "json",
             "v": "2.0"
         }
@@ -140,26 +140,22 @@ class AliExpressAPI:
                     print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}. Body: {resp.text[:100]}...")
                     return None
 
-                # 1. בדיקת שגיאת מערכת/הרשאות (למשל חתימה שגויה)
+                # בדיקת שגיאות תגובה
                 if "error_response" in data:
                     err = data["error_response"]
                     print(f"🛑 API ERROR for {item_id}: {err.get('msg')} (Code: {err.get('code')}) | {err.get('sub_msg')}")
                     return None
 
-                # 2. בדיקת תגובה תקינה מבחינת מבנה
                 response_root = data.get("aliexpress_affiliate_product_detail_get_response")
                 if not response_root:
                     print(f"⚠️ Unexpected JSON structure: {list(data.keys())}")
                     return None
 
                 resp_result = response_root.get("resp_result", {})
-                
-                # 3. בדיקת קוד לוגי (200 = הכל תקין)
                 if resp_result.get("resp_code") != 200:
                     print(f"⚠️ Logic Error (Item {item_id}): {resp_result.get('resp_msg')} (Code: {resp_result.get('resp_code')})")
                     return None
 
-                # 4. חילוץ המוצר בפועל
                 result_data = resp_result.get("result")
                 if not result_data:
                     print(f"⚠️ Item {item_id} exists but no data returned (Restricted? Sold out?).")
@@ -169,7 +165,7 @@ class AliExpressAPI:
                 if products:
                     return products[0]
                 else:
-                    print(f"⚠️ Item {item_id} product list is empty in response.")
+                    print(f"⚠️ Item {item_id} product list is empty.")
                     return None
 
         except Exception as e:
@@ -177,14 +173,16 @@ class AliExpressAPI:
         return None
 
     def generate_link(self, url: str) -> str | None:
-        """יוצר לינק שותף"""
+        # שינוי קריטי 2: שינוי פורמט הזמן גם כאן
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         params = {
             "app_key": self.config.affiliate_app_key,
-            "timestamp": str(int(time.time() * 1000)),
+            "timestamp": current_time,
             "sign_method": "md5",
             "method": "aliexpress.affiliate.link.generate",
             "urls": url,
-            "promotion_link_type": "2", # 2 = Hot Link (Best)
+            "promotion_link_type": "2",
             "tracking_id": f"tg_bot_{datetime.now().strftime('%m%d')}",
             "format": "json",
             "v": "2.0"
@@ -257,20 +255,17 @@ class DealBot:
         self.processed_ids = set()
 
     async def load_history(self):
-        """טוען היסטוריה על ידי סריקת ההודעות האחרונות בערוץ"""
         print(f"📚 Scanning last {self.config.max_messages_per_channel} messages for history...")
         try:
             async for msg in self.client.iter_messages(self.config.tg_target_channel, limit=self.config.max_messages_per_channel):
                 if not msg.message: continue
                 
-                # זיהוי ID בתוך לינק נסתר (השיטה החדשה)
                 if msg.entities:
                     for ent in msg.entities:
                         if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
                              match = re.search(r"bot-id/(\d+)", ent.url)
                              if match: self.processed_ids.add(match.group(1))
                 
-                # תמיכה בפורמט ישן (טקסט)
                 match_old = re.search(r"id[:\-](\\d+)", msg.message)
                 if match_old: self.processed_ids.add(match_old.group(1))
                 
@@ -287,7 +282,6 @@ class DealBot:
         for channel in self.config.tg_source_channels:
             print(f"👀 Scanning source: {channel}...")
             try:
-                # סורק 50 הודעות אחרונות מכל ערוץ מקור
                 async for msg in self.client.iter_messages(channel, limit=50):
                     if posts_count >= self.config.max_posts_per_run:
                         print("✋ Max posts reached for this run.")
@@ -295,12 +289,10 @@ class DealBot:
                     
                     if not msg.message: continue
 
-                    # 1. חילוץ לינקים
                     urls = re.findall(r"https?://[^\s]+", msg.message)
                     ali_url = next((u for u in urls if "aliexpress" in u or "bit.ly" in u or "s.click" in u), None)
                     if not ali_url: continue
 
-                    # 2. פענוח לינק ו-ID
                     real_url = resolve_url_smart(ali_url)
                     item_id = extract_item_id(real_url)
                     
@@ -309,18 +301,13 @@ class DealBot:
                         print(f"⏭️ Duplicate found: {item_id}")
                         continue
 
-                    # 3. בדיקת איכות (Quality Gate) + משיכת תמונה
                     details = self.ali.get_product_details(item_id)
                     
                     if not details:
-                        # כעת הלוג הפנימי של get_product_details כבר הדפיס את השגיאה
-                        # אז ההודעה הזו רק מסכמת שדילגנו
                         print(f"⚠️ Skipping {item_id} due to missing details.")
                         continue
 
-                    # לוגיקת הסינון
                     rating = float(details.get("evaluate_rate", "0").replace("%", "")) 
-                    # נרמול דירוג
                     if rating > 5: rating = rating / 20 
                     
                     orders = int(details.get("last_volume", 0))
@@ -336,19 +323,16 @@ class DealBot:
                         print(f"❌ Low Orders ({orders} < {self.config.min_orders}). Skip.")
                         continue
 
-                    # 4. יצירת לינק שותף
                     aff_link = self.ali.generate_link(real_url)
                     if not aff_link:
                         print("❌ Failed to generate affiliate link. Skip.")
                         continue
 
-                    # 5. כתיבת פוסט
                     caption = self.writer.write_post(msg.message, price)
                     
                     hidden_id = f"[‎](http://bot-id/{item_id})"
                     final_text = f"{hidden_id}{caption}\n\n👇 דיל בלעדי:\n{aff_link}"
 
-                    # 6. שליחה
                     clean_image = details.get("product_main_image_url")
                     
                     try:
