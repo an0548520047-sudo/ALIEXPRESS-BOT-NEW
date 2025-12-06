@@ -92,24 +92,23 @@ def extract_item_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 # =======================
-# AliExpress API Class (Taobao Router Fix)
+# AliExpress API Class (CORRECTED ENDPOINT)
 # =======================
 
 class AliExpressAPI:
     def __init__(self, config: Config):
         self.config = config
-        # שינוי קריטי: מעבר לשרת Taobao שהוא היציב ביותר
-        self.base_url = "https://api.taobao.com/router/rest"
+        # התיקון הסופי: השרת של עליאקספרס, אבל בנתיב REST
+        self.base_url = "https://api-sg.aliexpress.com/router/rest"
 
     def _sign(self, params: Dict[str, str]) -> str:
-        # החתימה נשארת זהה: Secret + Params + Secret
         s = "".join([f"{k}{params[k]}" for k in sorted(params.keys())])
         s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
         return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
     def get_product_details(self, item_id: str) -> Dict | None:
         print(f"🔍 Checking quality for item: {item_id}")
-        # שינוי קריטי 2: שינוי פורמט הזמן ל-YYYY-MM-DD HH:MM:SS
+        # חובה להשתמש בפורמט הזמן הזה עבור /router/rest
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         params = {
@@ -120,7 +119,7 @@ class AliExpressAPI:
             "product_ids": item_id,
             "target_currency": "ILS",
             "target_language": "HE",
-            "tracking_id": "bot_quality_check",
+            "tracking_id": "bot_check",
             "format": "json",
             "v": "2.0"
         }
@@ -140,7 +139,6 @@ class AliExpressAPI:
                     print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}. Body: {resp.text[:100]}...")
                     return None
 
-                # בדיקת שגיאות תגובה
                 if "error_response" in data:
                     err = data["error_response"]
                     print(f"🛑 API ERROR for {item_id}: {err.get('msg')} (Code: {err.get('code')}) | {err.get('sub_msg')}")
@@ -153,12 +151,13 @@ class AliExpressAPI:
 
                 resp_result = response_root.get("resp_result", {})
                 if resp_result.get("resp_code") != 200:
+                    # קוד 200 = הצלחה. כל קוד אחר אומר שיש בעיה עסקית (למשל מוצר לא קיים)
                     print(f"⚠️ Logic Error (Item {item_id}): {resp_result.get('resp_msg')} (Code: {resp_result.get('resp_code')})")
                     return None
 
                 result_data = resp_result.get("result")
                 if not result_data:
-                    print(f"⚠️ Item {item_id} exists but no data returned (Restricted? Sold out?).")
+                    print(f"⚠️ Item {item_id} valid but no data returned.")
                     return None
 
                 products = result_data.get("products", {}).get("product")
@@ -173,7 +172,6 @@ class AliExpressAPI:
         return None
 
     def generate_link(self, url: str) -> str | None:
-        # שינוי קריטי 2: שינוי פורמט הזמן גם כאן
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         params = {
