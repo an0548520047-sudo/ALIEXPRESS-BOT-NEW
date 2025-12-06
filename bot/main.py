@@ -67,7 +67,7 @@ class Config:
             affiliate_app_secret=_require_env("ALIEXPRESS_APP_SECRET"),
             openai_api_key=_require_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            max_messages_per_channel=_int_env("MAX_MESSAGES_PER_CHANNEL", 250), # הוגדל ל-250
+            max_messages_per_channel=_int_env("MAX_MESSAGES_PER_CHANNEL", 250),
             max_posts_per_run=_int_env("MAX_POSTS_PER_RUN", 10)
         )
 
@@ -94,21 +94,23 @@ def extract_item_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 # =======================
-# AliExpress API Class
+# AliExpress API Class (DEBUG VERSION)
 # =======================
 
 class AliExpressAPI:
     def __init__(self, config: Config):
         self.config = config
+        # נקודת קצה גלובלית - יציבה יותר
         self.base_url = "https://api-sg.aliexpress.com/sync"
 
     def _sign(self, params: Dict[str, str]) -> str:
+        # יצירת חתימה לפי הפרוטוקול של עליאקספרס
         s = "".join([f"{k}{params[k]}" for k in sorted(params.keys())])
         s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
         return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
     def get_product_details(self, item_id: str) -> Dict | None:
-        """בודק דירוג, הזמנות ומשיג תמונה נקייה"""
+        """בודק דירוג, הזמנות ומשיג תמונה נקייה. כולל הדפסת שגיאות מפורטת."""
         print(f"🔍 Checking quality for item: {item_id}")
         params = {
             "app_key": self.config.affiliate_app_key,
@@ -118,23 +120,60 @@ class AliExpressAPI:
             "product_ids": item_id,
             "target_currency": "ILS",
             "target_language": "HE",
-            "tracking_id": "bot_quality_check",
+            "tracking_id": "bot_debug_check",
             "format": "json",
             "v": "2.0"
         }
         params["sign"] = self._sign(params)
 
         try:
-            with httpx.Client(timeout=15) as client:
-                resp = client.post(self.base_url, data=params, headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
-                data = resp.json()
+            with httpx.Client(timeout=20) as client:
+                resp = client.post(
+                    self.base_url, 
+                    data=params, 
+                    headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+                )
                 
-                if "aliexpress_affiliate_product_detail_get_response" in data:
-                    products = data["aliexpress_affiliate_product_detail_get_response"]["resp_result"]["result"]["products"]["product"]
-                    if products:
-                        return products[0] # מחזיר את המידע על המוצר
+                try:
+                    data = resp.json()
+                except json.JSONDecodeError:
+                    print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}. Body: {resp.text[:100]}...")
+                    return None
+
+                # 1. בדיקת שגיאת מערכת/הרשאות (למשל חתימה שגויה)
+                if "error_response" in data:
+                    err = data["error_response"]
+                    print(f"🛑 API ERROR for {item_id}: {err.get('msg')} (Code: {err.get('code')}) | {err.get('sub_msg')}")
+                    return None
+
+                # 2. בדיקת תגובה תקינה מבחינת מבנה
+                response_root = data.get("aliexpress_affiliate_product_detail_get_response")
+                if not response_root:
+                    print(f"⚠️ Unexpected JSON structure: {list(data.keys())}")
+                    return None
+
+                resp_result = response_root.get("resp_result", {})
+                
+                # 3. בדיקת קוד לוגי (200 = הכל תקין)
+                if resp_result.get("resp_code") != 200:
+                    print(f"⚠️ Logic Error (Item {item_id}): {resp_result.get('resp_msg')} (Code: {resp_result.get('resp_code')})")
+                    return None
+
+                # 4. חילוץ המוצר בפועל
+                result_data = resp_result.get("result")
+                if not result_data:
+                    print(f"⚠️ Item {item_id} exists but no data returned (Restricted? Sold out?).")
+                    return None
+
+                products = result_data.get("products", {}).get("product")
+                if products:
+                    return products[0]
+                else:
+                    print(f"⚠️ Item {item_id} product list is empty in response.")
+                    return None
+
         except Exception as e:
-            print(f"⚠️ API Detail Error: {e}")
+            print(f"⚠️ Connection/HTTP Exception: {e}")
         return None
 
     def generate_link(self, url: str) -> str | None:
@@ -146,22 +185,30 @@ class AliExpressAPI:
             "method": "aliexpress.affiliate.link.generate",
             "urls": url,
             "promotion_link_type": "2", # 2 = Hot Link (Best)
-            "tracking_id": f"tg_bot_{datetime.now().strftime('%m%d')}", # מעקב דינמי
+            "tracking_id": f"tg_bot_{datetime.now().strftime('%m%d')}",
             "format": "json",
             "v": "2.0"
         }
         params["sign"] = self._sign(params)
 
         try:
-            with httpx.Client(timeout=15) as client:
+            with httpx.Client(timeout=20) as client:
                 resp = client.post(self.base_url, data=params, headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"})
                 data = resp.json()
+                
+                if "error_response" in data:
+                     print(f"🛑 Link Gen Error: {data['error_response'].get('sub_msg')}")
+                     return None
+
                 if "aliexpress_affiliate_link_generate_response" in data:
                     res = data["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]
                     if "promotion_links" in res and res["promotion_links"]["promotion_link"]:
                         return res["promotion_links"]["promotion_link"][0]["promotion_link"]
+                else:
+                     print(f"⚠️ Link Gen Structure Mismatch: {data}")
+                     
         except Exception as e:
-            print(f"⚠️ API Link Gen Error: {e}")
+            print(f"⚠️ API Link Gen Exception: {e}")
         return None
 
 # =======================
@@ -190,7 +237,7 @@ class Copywriter:
             res = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.8, # קצת יותר יצירתיות
+                temperature=0.8,
                 max_tokens=250
             )
             return res.choices[0].message.content.strip()
@@ -224,7 +271,7 @@ class DealBot:
                              if match: self.processed_ids.add(match.group(1))
                 
                 # תמיכה בפורמט ישן (טקסט)
-                match_old = re.search(r"id[:\-](\d+)", msg.message)
+                match_old = re.search(r"id[:\-](\\d+)", msg.message)
                 if match_old: self.processed_ids.add(match_old.group(1))
                 
         except Exception as e:
@@ -266,13 +313,15 @@ class DealBot:
                     details = self.ali.get_product_details(item_id)
                     
                     if not details:
-                        print(f"⚠️ Could not get details for {item_id}, skipping (Strict Mode).")
+                        # כעת הלוג הפנימי של get_product_details כבר הדפיס את השגיאה
+                        # אז ההודעה הזו רק מסכמת שדילגנו
+                        print(f"⚠️ Skipping {item_id} due to missing details.")
                         continue
 
                     # לוגיקת הסינון
                     rating = float(details.get("evaluate_rate", "0").replace("%", "")) 
-                    # לפעמים הדירוג מגיע באחוזים או מספר, ננסה לנרמל
-                    if rating > 5: rating = rating / 20 # המרה מ-100 ל-5
+                    # נרמול דירוג
+                    if rating > 5: rating = rating / 20 
                     
                     orders = int(details.get("last_volume", 0))
                     price = details.get("target_sale_price", "")
@@ -290,30 +339,24 @@ class DealBot:
                     # 4. יצירת לינק שותף
                     aff_link = self.ali.generate_link(real_url)
                     if not aff_link:
-                        # אם ה-API של הלינקים נכשל, אבל המוצר טוב, אפשר להשתמש בלינק נקי או לדלג.
-                        # בגלל שביקשת איכות, אם אין לינק שותף - נדלג.
                         print("❌ Failed to generate affiliate link. Skip.")
                         continue
 
                     # 5. כתיבת פוסט
                     caption = self.writer.write_post(msg.message, price)
                     
-                    # לינק נסתר למניעת כפילויות עתידיות
                     hidden_id = f"[‎](http://bot-id/{item_id})"
                     final_text = f"{hidden_id}{caption}\n\n👇 דיל בלעדי:\n{aff_link}"
 
-                    # 6. שליחה (עם תמונה נקייה אם יש)
+                    # 6. שליחה
                     clean_image = details.get("product_main_image_url")
                     
                     try:
                         if clean_image:
-                            # שליחת התמונה הנקייה מה-API
                             await self.client.send_file(self.config.tg_target_channel, clean_image, caption=final_text)
                         elif msg.media:
-                            # פולבק: התמונה המקורית (עם סיכון ללוגו)
                             await self.client.send_file(self.config.tg_target_channel, msg.media, caption=final_text)
                         else:
-                            # רק טקסט
                             await self.client.send_message(self.config.tg_target_channel, final_text, link_preview=True)
                         
                         print(f"✅ Published Item: {item_id}")
