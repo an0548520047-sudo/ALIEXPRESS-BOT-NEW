@@ -118,6 +118,19 @@ def _float_env(
         return default
 
     try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"Warning: {_float_env.__name__} received unexpected keyword args {list(extra.keys())}. "
+            "They will be ignored.",
+            flush=True,
+        )
+
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    try:
         return int(os.getenv(name, str(default)))
     except:
         return default
@@ -224,6 +237,19 @@ class AliExpressAPI:
 
         return "star.aliexpress" in parsed.netloc.lower()
 
+    def _is_product_specific(self, url: str) -> bool:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+
+        if not parsed.netloc:
+            return False
+
+        product_markers = ["/item/", "/i/", "/share/"]
+        if any(marker in path for marker in product_markers):
+            return True
+
+        return "star.aliexpress" in parsed.netloc.lower()
+
     def _sign_params(self, params: Dict[str, str]) -> str:
         if not self.config.affiliate_app_secret:
             return ""
@@ -249,54 +275,40 @@ class AliExpressAPI:
             "target_language": "HE",
             "tracking_id": "bot_check",
             "format": "json",
-            "v": "2.0"
+            "v": "2.0",
         }
-        params["sign"] = self._sign(params)
+        params["sign"] = self._sign_params(params)
+        headers = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
 
         try:
-            with httpx.Client(timeout=20) as client:
-                resp = client.post(
-                    self.base_url, 
-                    data=params, 
-                    headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+            with httpx.Client(timeout=self.config.affiliate_api_timeout) as http_client:
+                response = http_client.post(
+                    self.config.affiliate_api_endpoint,
+                    data=params,
+                    headers=headers,
                 )
-                
-                try:
-                    data = resp.json()
-                except json.JSONDecodeError:
-                    print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}. Body: {resp.text[:100]}...")
-                    return None
+            response.raise_for_status()
+        except Exception as exc:
+            print(f"API call failed: {exc}")
+            return None
 
-                if "error_response" in data:
-                    err = data["error_response"]
-                    print(f"🛑 API ERROR for {item_id}: {err.get('msg')} (Code: {err.get('code')}) | {err.get('sub_msg')}")
-                    return None
+        data = response.json()
+        if "aliexpress_affiliate_link_generate_response" in data:
+            resp_body = data["aliexpress_affiliate_link_generate_response"].get("resp_result", {}).get("result", {})
+            promotions = resp_body.get("promotion_links", {}).get("promotion_link", [])
+            if promotions:
+                return _canonical_url(promotions[0].get("promotion_link"))
 
-                response_root = data.get("aliexpress_affiliate_product_detail_get_response")
-                if not response_root:
-                    print(f"⚠️ Unexpected JSON structure: {list(data.keys())}")
-                    return None
+        candidates = [
+            data.get("result", {}).get("promotion_links", [{}])[0].get("promotion_link")
+            if data.get("result")
+            else None,
+            data.get("promotion_link"),
+        ]
+        for cand in candidates:
+            if cand:
+                return _canonical_url(cand)
 
-                resp_result = response_root.get("resp_result", {})
-                if resp_result.get("resp_code") != 200:
-                    # קוד 200 = הצלחה. כל קוד אחר אומר שיש בעיה עסקית (למשל מוצר לא קיים)
-                    print(f"⚠️ Logic Error (Item {item_id}): {resp_result.get('resp_msg')} (Code: {resp_result.get('resp_code')})")
-                    return None
-
-                result_data = resp_result.get("result")
-                if not result_data:
-                    print(f"⚠️ Item {item_id} valid but no data returned.")
-                    return None
-
-                products = result_data.get("products", {}).get("product")
-                if products:
-                    return products[0]
-                else:
-                    print(f"⚠️ Item {item_id} product list is empty.")
-                    return None
-
-        except Exception as e:
-            print(f"⚠️ Connection/HTTP Exception: {e}")
         return None
 
     def _from_portal_template(self, clean_url: str) -> str | None:
