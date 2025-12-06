@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 import time
 import hashlib
 import json
@@ -31,7 +32,91 @@ def _require_env(name: str) -> str:
             return ""
     return value.strip()
 
-def _int_env(name: str, default: int) -> int:
+
+def _missing_env_vars(names: Iterable[str]) -> List[str]:
+    missing = []
+    for name in names:
+        value = os.getenv(name)
+        if value is None or value.strip() == "":
+            missing.append(name)
+    return missing
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _list_env(name: str) -> List[str]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return []
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _optional_str(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    return cleaned or None
+
+
+def _int_env(name: str, default: int, *, allow_zero: bool = False, min_value: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError:
+        print(
+            f"Warning: {name} must be an integer; got {raw!r}. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    if min_value is not None and value < min_value:
+        print(
+            f"Warning: {name} must be >= {min_value}; got {value!r}. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    if value == 0 and not allow_zero:
+        print(
+            f"Warning: {name} must be positive; got 0. "
+            f"Falling back to default={default}",
+            flush=True,
+        )
+        return default
+
+    return value
+
+
+def _float_env(
+    name: str,
+    default: float,
+    *,
+    allow_zero: bool = False,
+    min_value: float | None = None,
+    **extra: object,
+) -> float:
+    if extra:
+        print(
+            f"Warning: {_float_env.__name__} received unexpected keyword args {list(extra.keys())}. "
+            "They will be ignored.",
+            flush=True,
+        )
+
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
     try:
         return int(os.getenv(name, str(default)))
     except:
@@ -44,8 +129,15 @@ class Config:
     tg_session: str
     tg_source_channels: List[str]
     tg_target_channel: str
-    affiliate_app_key: str
-    affiliate_app_secret: str
+    
+    affiliate_api_endpoint: str | None
+    affiliate_app_key: str | None
+    affiliate_app_secret: str | None
+    affiliate_api_timeout: float
+    affiliate_portal_template: str | None
+    affiliate_prefix: str | None
+    affiliate_prefix_encode: bool
+    
     openai_api_key: str
     openai_model: str
     max_messages_per_channel: int
@@ -55,14 +147,34 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        tg_source_channels = [c.strip() for c in _require_env("TG_SOURCE_CHANNELS").split(",") if c.strip()]
+        if not tg_source_channels:
+            raise RuntimeError("TG_SOURCE_CHANNELS is set but empty after parsing")
+
+        affiliate_api_endpoint = _optional_str("AFFILIATE_API_ENDPOINT")
+        affiliate_portal_template = _optional_str("AFFILIATE_PORTAL_LINK")
+        affiliate_prefix = _optional_str("AFFILIATE_PREFIX")
+        affiliate_prefix_encode = _bool_env("AFFILIATE_PREFIX_ENCODE", True)
+        affiliate_app_key = _optional_str("ALIEXPRESS_API_APP_KEY")
+        affiliate_app_secret = _optional_str("ALIEXPRESS_API_APP_SECRET")
+
+        # Allow running if at least one method is present
+        if not (affiliate_api_endpoint or affiliate_portal_template or affiliate_prefix):
+            pass
+
         return cls(
             tg_api_id=int(_require_env("TG_API_ID")),
             tg_api_hash=_require_env("TG_API_HASH"),
             tg_session=_require_env("TG_SESSION"),
             tg_source_channels=[c.strip() for c in _require_env("TG_SOURCE_CHANNELS").split(",") if c.strip()],
             tg_target_channel=_require_env("TG_TARGET_CHANNEL"),
-            affiliate_app_key=_require_env("ALIEXPRESS_APP_KEY"),
-            affiliate_app_secret=_require_env("ALIEXPRESS_APP_SECRET"),
+            affiliate_api_endpoint=affiliate_api_endpoint,
+            affiliate_app_key=affiliate_app_key,
+            affiliate_app_secret=affiliate_app_secret,
+            affiliate_api_timeout=_float_env("AFFILIATE_API_TIMEOUT", 5.0, min_value=1e-6),
+            affiliate_portal_template=affiliate_portal_template,
+            affiliate_prefix=affiliate_prefix,
+            affiliate_prefix_encode=affiliate_prefix_encode,
             openai_api_key=_require_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             max_messages_per_channel=_int_env("MAX_MESSAGES_PER_CHANNEL", 250),
@@ -98,19 +210,35 @@ def extract_item_id(url: str) -> str | None:
 class AliExpressAPI:
     def __init__(self, config: Config):
         self.config = config
-        # התיקון הסופי: השרת של עליאקספרס, אבל בנתיב REST
-        self.base_url = "https://api-sg.aliexpress.com/router/rest"
 
-    def _sign(self, params: Dict[str, str]) -> str:
-        s = "".join([f"{k}{params[k]}" for k in sorted(params.keys())])
-        s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
-        return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
+    def _is_product_specific(self, url: str) -> bool:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
 
-    def get_product_details(self, item_id: str) -> Dict | None:
-        print(f"🔍 Checking quality for item: {item_id}")
-        # חובה להשתמש בפורמט הזמן הזה עבור /router/rest
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+        if not parsed.netloc:
+            return False
+
+        product_markers = ["/item/", "/i/", "/share/"]
+        if any(marker in path for marker in product_markers):
+            return True
+
+        return "star.aliexpress" in parsed.netloc.lower()
+
+    def _sign_params(self, params: Dict[str, str]) -> str:
+        if not self.config.affiliate_app_secret:
+            return ""
+        sorted_keys = sorted(params.keys())
+        param_str = ""
+        for key in sorted_keys:
+            param_str += f"{key}{params[key]}"
+        sign_source = f"{self.config.affiliate_app_secret}{param_str}{self.config.affiliate_app_secret}"
+        return hashlib.md5(sign_source.encode("utf-8")).hexdigest().upper()
+
+    def _from_api(self, original_url: str) -> str | None:
+        if not self.config.affiliate_api_endpoint or not self.config.affiliate_app_key:
+            return None
+
+        timestamp = str(int(time.time() * 1000))
         params = {
             "app_key": self.config.affiliate_app_key,
             "timestamp": current_time,
@@ -171,21 +299,69 @@ class AliExpressAPI:
             print(f"⚠️ Connection/HTTP Exception: {e}")
         return None
 
-    def generate_link(self, url: str) -> str | None:
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        params = {
-            "app_key": self.config.affiliate_app_key,
-            "timestamp": current_time,
-            "sign_method": "md5",
-            "method": "aliexpress.affiliate.link.generate",
-            "urls": url,
-            "promotion_link_type": "2",
-            "tracking_id": f"tg_bot_{datetime.now().strftime('%m%d')}",
-            "format": "json",
-            "v": "2.0"
-        }
-        params["sign"] = self._sign(params)
+    def _from_portal_template(self, clean_url: str) -> str | None:
+        if not self.config.affiliate_portal_template:
+            return None
+
+        encoded = quote(clean_url, safe="")
+        template = self.config.affiliate_portal_template
+
+        if "{url}" in template:
+            return template.replace("{url}", encoded).strip()
+
+        # If no placeholder is present, the portal template cannot point to the specific product
+        print("Affiliate portal template missing {url} placeholder; falling back")
+        return None
+
+    def _from_prefix(self, clean_url: str) -> str | None:
+        if not self.config.affiliate_prefix:
+            return None
+
+        if self.config.affiliate_prefix_encode:
+            return f"{self.config.affiliate_prefix}{quote(clean_url, safe='')}".strip()
+
+        return f"{self.config.affiliate_prefix}{clean_url}".strip()
+
+    def build(self, original_url: str) -> str:
+        resolved = resolve_final_url(original_url, enabled=self.config.resolve_redirects, timeout_seconds=self.config.resolve_redirect_timeout)
+        cleaned = clean_product_url(resolved)
+
+        candidates = [
+            ("API", self._from_api(cleaned)),
+            ("portal template", self._from_portal_template(cleaned)),
+            ("prefix", self._from_prefix(cleaned)),
+        ]
+
+        for source, link in candidates:
+            if not link:
+                continue
+
+            if self._is_product_specific(link):
+                print(f"Using affiliate link from {source}")
+                return link
+
+            print(f"Ignoring {source} affiliate candidate that does not point to a specific product")
+
+        return cleaned
+
+
+# ===============
+# Caption creator
+# ===============
+
+
+def extract_fact_hints(text: str) -> Dict[str, str]:
+    hints: Dict[str, str] = {}
+    price_match = re.search(r"(₪|\$)\s?\d+[\d.,]*", text)
+    if price_match: hints["price"] = price_match.group(0)
+    rating_match = re.search(r"(?:⭐|rating[:\s]*)(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    if rating_match: hints["rating"] = rating_match.group(1)
+    orders_match = re.search(r"(\d[\d.,]*\+?)\s*(?:orders|הזמנות|sold)", text, re.IGNORECASE)
+    if orders_match: hints["orders"] = orders_match.group(1)
+    coupon_matches = re.findall(r"(?:קופון|coupon|code)[:\s]*([A-Za-z0-9-]+)", text, re.IGNORECASE)
+    if coupon_matches: hints["coupons"] = ", ".join(dict.fromkeys(coupon_matches))
+    return hints
+
 
         try:
             with httpx.Client(timeout=20) as client:
@@ -351,8 +527,36 @@ class DealBot:
             except Exception as e:
                 print(f"Error scanning channel {channel}: {e}")
 
-async def main():
-    config = Config.from_env()
+async def main() -> None:
+    required = [
+        "TG_SOURCE_CHANNELS",
+        "TG_TARGET_CHANNEL",
+        "TG_API_ID",
+        "TG_API_HASH",
+        "TG_SESSION",
+        "OPENAI_API_KEY",
+    ]
+
+    missing = _missing_env_vars(required)
+    if missing:
+        log_info("Bot is not configured; no posts will be sent until required variables are set.")
+        log_info("Missing required environment variables:")
+        for name in missing:
+            log_info(f"- {name}")
+        raise SystemExit(1)
+
+    try:
+        config = Config.from_env()
+    except RuntimeError as exc:
+        log_info("Bot is not configured; no posts will be sent until required variables are set.")
+        log_info(str(exc))
+        raise SystemExit(1)
+
+    if not (config.affiliate_api_endpoint or config.affiliate_portal_template or config.affiliate_prefix):
+        log_info(
+            "Affiliate configuration is missing (AFFILIATE_API_ENDPOINT/AFFILIATE_PORTAL_LINK/AFFILIATE_PREFIX); "
+            "using the original product link without commission."
+        )
     client = TelegramClient(StringSession(config.tg_session), config.tg_api_id, config.tg_api_hash)
     oa_client = OpenAI(api_key=config.openai_api_key)
     
