@@ -1,433 +1,303 @@
-from __future__ import annotations
-
-import asyncio
+# -*- coding: utf-8 -*-
 import os
-import re
+import sys
 import time
-import hashlib
 import json
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import asyncio
+import re
+import logging
+from datetime import datetime
+from urllib.parse import quote_plus
 
+# צד שלישי
 import httpx
-from openai import OpenAI
-from telethon import TelegramClient
+from telethon import TelegramClient, events, sync
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityTextUrl
+from openai import OpenAI
 
-# ==================
-# Config & Helpers
-# ==================
+# ==========================================
+# הגדרות לוגים (כדי שנבין מה קורה)
+# ==========================================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-def _require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value or not value.strip():
-        alt = name.replace("API_", "")
-        value = os.getenv(alt) or os.getenv(name.replace("ALIEXPRESS_", "AFFILIATE_"))
-        
-        if not value or not value.strip():
-            if any(x in name for x in ["APP_KEY", "SESSION", "HASH", "API_ID"]):
-                raise RuntimeError(f"Missing required env: {name}")
-            return ""
-    return value.strip()
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except:
-        return default
-
-@dataclass
+# ==========================================
+# הגדרות קונפיגורציה (טעינה מה-Secrets)
+# ==========================================
 class Config:
-    tg_api_id: int
-    tg_api_hash: str
-    tg_session: str
-    tg_source_channels: List[str]
-    tg_target_channel: str
-    affiliate_app_key: str
-    affiliate_app_secret: str
-    openai_api_key: str
-    openai_model: str
-    max_messages_per_channel: int
-    max_posts_per_run: int
-    min_rating: float = 4.6
-    min_orders: int = 500
+    # Telegram
+    API_ID = int(os.environ.get("TG_API_ID", 0))
+    API_HASH = os.environ.get("TG_API_HASH")
+    SESSION_STR = os.environ.get("TG_SESSION")
+    SOURCE_CHANNELS = [x.strip() for x in os.environ.get("TG_SOURCE_CHANNELS", "").split(",") if x.strip()]
+    TARGET_CHANNEL = os.environ.get("TG_TARGET_CHANNEL")
 
-    @classmethod
-    def from_env(cls) -> "Config":
-        return cls(
-            tg_api_id=int(_require_env("TG_API_ID")),
-            tg_api_hash=_require_env("TG_API_HASH"),
-            tg_session=_require_env("TG_SESSION"),
-            tg_source_channels=[c.strip() for c in _require_env("TG_SOURCE_CHANNELS").split(",") if c.strip()],
-            tg_target_channel=_require_env("TG_TARGET_CHANNEL"),
-            affiliate_app_key=_require_env("ALIEXPRESS_APP_KEY"),
-            affiliate_app_secret=_require_env("ALIEXPRESS_APP_SECRET"),
-            openai_api_key=_require_env("OPENAI_API_KEY"),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            max_messages_per_channel=_int_env("MAX_MESSAGES_PER_CHANNEL", 250),
-            max_posts_per_run=_int_env("MAX_POSTS_PER_RUN", 10)
-        )
+    # AliExpress
+    APP_KEY = os.environ.get("ALIEXPRESS_APP_KEY")
+    APP_SECRET = os.environ.get("ALIEXPRESS_APP_SECRET")
+    
+    # OpenAI
+    OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+    
+    # הגדרות סינון
+    MIN_PRICE = 0.1
+    MAX_MESSAGES = 30  # כמה הודעות אחרונות לסרוק
 
-# =======================
-# Logic Utils
-# =======================
+# בדיקת תקינות משתנים
+if not Config.APP_KEY or not Config.APP_SECRET:
+    logger.critical("❌ Missing ALIEXPRESS_APP_KEY or ALIEXPRESS_APP_SECRET")
+    sys.exit(1)
 
-def resolve_url_smart(url: str) -> str:
-    """Follows redirects to get the real product URL."""
-    if "aliexpress" in url and "s.click" not in url and "/item/" in url:
-        return url
-    try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
-            resp = client.head(url, follow_redirects=True)
-            final_url = str(resp.url)
-            return final_url.replace("m.aliexpress", "www.aliexpress")
-    except:
-        return url
+# ==========================================
+# מחלקת עליאקספרס (בנייה מחדש)
+# ==========================================
+class AliExpressClient:
+    def __init__(self, app_key, app_secret):
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.gateway = "https://api-sg.aliexpress.com/sync"  # שרת גלובלי ראשי
 
-def extract_item_id(url: str) -> str | None:
-    """Extracts the numeric item ID from the URL."""
-    match = re.search(r"/item/(\d+)\.html", url)
-    if match: return match.group(1)
-    match = re.search(r"(\d{10,})", url)
-    return match.group(1) if match else None
-
-# =======================
-# AliExpress API Class
-# =======================
-
-class AliExpressAPI:
-    def __init__(self, config: Config):
-        self.config = config
-        self.base_url = "https://api-sg.aliexpress.com/router/rest"
-        self.working_offset = None  # Will store the correct timezone once found
-
-    def _sign(self, params: Dict[str, str]) -> str:
-        sorted_keys = sorted(params.keys())
-        s = "".join([f"{k}{params[k]}" for k in sorted_keys])
-        s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
-        return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
-
-    def _send_request_with_time(self, method: str, api_params: Dict[str, str], time_offset: int) -> Optional[Dict]:
-        """Helper to send request with a specific timezone offset."""
+    def _generate_sign(self, params):
+        """
+        יצירת חתימה לפי התקן המדויק של עליאקספרס:
+        1. מיון מפתחות אלפביתי
+        2. שרשור Secret + Key + Value + ... + Secret
+        3. המרה ל-MD5 Uppercase
+        """
+        # מיון הפרמטרים
+        keys = sorted(params.keys())
         
-        utc_now = datetime.now(timezone.utc)
-        target_time = utc_now + timedelta(hours=time_offset)
-        current_time_str = target_time.strftime("%Y-%m-%d %H:%M:%S")
-        
-        system_params = {
-            "app_key": self.config.affiliate_app_key,
-            "timestamp": current_time_str,
-            "sign_method": "md5",
-            "method": method,
+        # יצירת המחרוזת לחתימה
+        sign_str = self.app_secret
+        for key in keys:
+            val = str(params[key])
+            sign_str += f"{key}{val}"
+        sign_str += self.app_secret
+
+        # הצפנה
+        m = hashlib.md5()
+        m.update(sign_str.encode("utf-8"))
+        return m.hexdigest().upper()
+
+    def execute(self, method, api_params):
+        """שליחת בקשה לשרת"""
+        # פרמטרים מערכתיים
+        sys_params = {
+            "app_key": self.app_key,
+            "timestamp": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), # UTC נקי
             "format": "json",
+            "method": method,
+            "sign_method": "md5",
             "v": "2.0"
         }
+
+        # איחוד פרמטרים
+        all_params = {**sys_params, **api_params}
         
-        full_params = {**system_params, **api_params}
-        full_params["sign"] = self._sign(full_params)
+        # חתימה
+        all_params["sign"] = self._generate_sign(all_params)
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "Keep-Alive",
+        }
 
         try:
-            with httpx.Client(timeout=10) as client:
-                resp = client.post(
-                    self.base_url, 
-                    data=full_params, 
-                    headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
-                )
-                
-                try:
-                    data = resp.json()
-                except json.JSONDecodeError:
-                    return None
-
-                # Check for Timestamp Error specifically
-                if "error_response" in data:
-                    msg = data["error_response"].get("msg", "")
-                    if "IllegalTimestamp" in msg:
-                        return "RETRY" 
-                    return None 
-                
-                # Check ISV Timestamp Error
-                if data.get("code") == "IllegalTimestamp":
-                    return "RETRY"
-
-                # If we got here, the request was accepted (even if it has logic errors later)
-                # This means the TIMESTAMP was valid.
-                return data
-
-        except Exception:
+            # שליחה ב-POST
+            with httpx.Client(timeout=15.0) as client:
+                response = client.post(self.gateway, data=all_params, headers=headers)
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.error(f"Network Error: {e}")
             return None
 
-    def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
-        """Auto-detects the correct timezone offset."""
-        
-        # If we already found a working offset, use it directly
-        if self.working_offset is not None:
-            data = self._send_request_with_time(method, api_params, self.working_offset)
-            if data != "RETRY":
-                return data
-            # If it failed again, reset and search again (clock drift?)
-            print("⚠️ Saved timezone failed. Re-scanning...")
-            self.working_offset = None
-
-        # List of candidate offsets to try: 
-        # UTC, Beijing(+8), PST(-8), CET(+1), EST(-5)
-        candidates = [0, 8, -8, 1, -5]
-        
-        print(f"🔄 Scanning timezones for {method}...")
-        
-        for offset in candidates:
-            data = self._send_request_with_time(method, api_params, offset)
-            
-            if data is not None and data != "RETRY":
-                print(f"✅ FOUND WORKING TIMEZONE: UTC{'+' if offset >=0 else ''}{offset}")
-                self.working_offset = offset # Lock it!
-                return data
-        
-        print(f"🛑 CRITICAL: All timezones failed. Server clock is likely wildly off.")
-        return None
-
-    def get_product_details(self, item_id: str) -> Dict | None:
-        print(f"🔍 Checking quality for item: {item_id}")
-        
+    def get_details(self, product_id):
+        """קבלת פרטי מוצר"""
         params = {
-            "product_ids": item_id,
+            "product_ids": product_id,
             "target_currency": "ILS",
-            "target_language": "HE",
-            "tracking_id": "bot_check"
+            "target_language": "HE"
         }
-
-        method_name = "aliexpress.affiliate.product.detail.get"
-        data = self._send_request(method_name, params)
+        res = self.execute("aliexpress.affiliate.product.detail.get", params)
         
-        if not data:
+        # בדיקת תקינות תשובה
+        if not res or "error_response" in res:
+            err = res.get("error_response", {}) if res else "No Response"
+            logger.error(f"API Error (Details): {err}")
             return None
-
-        response_root = data.get("aliexpress_affiliate_product_detail_get_response")
-        if not response_root:
-            print(f"⚠️ Unexpected JSON structure for item {item_id}")
-            return None
-
-        resp_result = response_root.get("resp_result", {})
-        if resp_result.get("resp_code") != 200:
-            msg = resp_result.get("resp_msg", "Unknown Logic Error")
-            print(f"⚠️ Logic Error (Item {item_id}): {msg}")
-            return None
-
-        result_data = resp_result.get("result")
-        if not result_data:
-            print(f"⚠️ Item {item_id} valid but no data returned (Sold out/Restricted).")
-            return None
-
-        products = result_data.get("products", {}).get("product")
-        if products:
-            return products[0]
-        else:
-            print(f"⚠️ Item {item_id} product list is empty.")
-            return None
-
-    def generate_link(self, url: str) -> str | None:
-        track_id = f"tg_bot_{datetime.now().strftime('%m%d')}"
-        
-        params = {
-            "urls": url,
-            "promotion_link_type": "2",
-            "tracking_id": track_id
-        }
-
-        method_name = "aliexpress.affiliate.link.generate"
-        data = self._send_request(method_name, params)
-        
-        if not data:
-            return None
-
-        if "aliexpress_affiliate_link_generate_response" in data:
-            root = data["aliexpress_affiliate_link_generate_response"]
-            res = root.get("resp_result", {}).get("result", {})
             
-            if "promotion_links" in res:
-                promos = res["promotion_links"].get("promotion_link")
-                if promos and len(promos) > 0:
-                    return promos[0]["promotion_link"]
-        
-        print(f"⚠️ Link Gen Structure Mismatch or No Link Returned")
-        return None
+        try:
+            result = res["aliexpress_affiliate_product_detail_get_response"]["resp_result"]["result"]
+            return result["products"]["product"][0]
+        except (KeyError, IndexError):
+            return None
 
-# =======================
-# Content Generation
-# =======================
+    def generate_link(self, original_url):
+        """יצירת לינק שותפים"""
+        params = {
+            "promotion_link_type": "0",  # 0 = רגיל, 2 = Hot Link
+            "source_values": original_url,
+            "tracking_id": "telegram_bot"
+        }
+        res = self.execute("aliexpress.affiliate.link.generate", params)
 
-class Copywriter:
-    def __init__(self, client: OpenAI, model: str):
-        self.client = client
-        self.model = model
-
-    def write_post(self, original_text: str, price: str = "") -> str:
-        prompt_parts = (
-            "אתה קופירייטר ישראלי מומחה לשיווק בטלגרם.\n",
-            "המטרה: לכתוב פוסט קצר, דחוף ואנרגטי שגורם לאנשים להקליק ולקנות מיד.\n",
-            f"המוצר מתואר בטקסט המקור: \"{original_text[:300]}\"\n",
-            f"מחיר (אם ידוע): {price}\n\n",
-            "הנחיות:\n",
-            "1. כותרת חזקה עם אימוג'י (למשל: הלם 😱, מחיר הזיה 📉, חוטפים את זה 🔥).\n",
-            "2. גוף הטקסט: 2-3 משפטים קצרים בסלנג ישראלי טבעי ('תקשיבו זה מטורף', 'אל תפספסו').\n",
-            "3. בלי האשטאגים. בלי 'שלום לכולם'. ישר ולעניין.\n",
-            "4. תדגיש את המחיר אם הוא זול."
-        )
-        final_prompt = "".join(prompt_parts)
+        if not res or "error_response" in res:
+            err = res.get("error_response", {}) if res else "No Response"
+            logger.error(f"API Error (Link): {err}")
+            return None
 
         try:
-            res = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": final_prompt}],
-                temperature=0.8,
-                max_tokens=250
+            result = res["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]
+            return result["promotion_links"]["promotion_link"][0]["promotion_link"]
+        except (KeyError, IndexError):
+            return None
+
+# ==========================================
+# כלי עזר (Utils)
+# ==========================================
+def extract_id(url):
+    """חילוץ ID מהלינק"""
+    # ניסיון 1: לפי סיומת html
+    match = re.search(r'/item/(\d+)\.html', url)
+    if match: return match.group(1)
+    
+    # ניסיון 2: סתם מספר ארוך
+    match = re.search(r'(\d{11,})', url)
+    if match: return match.group(1)
+    
+    return None
+
+def resolve_url(url):
+    """פתיחת קיצורים (bit.ly, s.click וכו')"""
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10) as client:
+            resp = client.head(url)
+            return str(resp.url).split('?')[0] # מנקה זבל מה-URL
+    except:
+        return url
+
+# ==========================================
+# קופירייטר (OpenAI)
+# ==========================================
+class AIWriter:
+    def __init__(self):
+        self.client = OpenAI(api_key=Config.OPENAI_KEY) if Config.OPENAI_KEY else None
+
+    def generate(self, text, price):
+        if not self.client:
+            return "מציאה מאליאקספרס! 👇"
+
+        prompt = f"""
+        כתוב פוסט מכירה קצר וקולע לטלגרם בעברית (סלנג קליל).
+        המוצר: {text[:200]}
+        מחיר: {price}
+        
+        מבנה:
+        כותרת אש 🔥
+        משפט התלהבות
+        הנעה לפעולה
+        בלי האשטאגים.
+        """
+        
+        try:
+            resp = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150
             )
-            return res.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"⚠️ OpenAI Error: {e}")
-            return "דיל מטורף מאליאקספרס! אל תפספסו את המחיר הזה 🔥👇"
+            return resp.choices[0].message.content.strip()
+        except:
+            return "דיל שווה בטירוף! אל תפספסו 👇"
 
-# =======================
-# Main Bot Logic
-# =======================
-
-class DealBot:
-    def __init__(self, client: TelegramClient, ali_api: AliExpressAPI, copywriter: Copywriter, config: Config):
-        self.client = client
-        self.ali = ali_api
-        self.writer = copywriter
-        self.config = config
-        self.processed_ids = set()
-
-    async def load_history(self):
-        print(f"📚 Scanning last {self.config.max_messages_per_channel} messages for history...")
+# ==========================================
+# הבוט הראשי
+# ==========================================
+async def main():
+    logger.info("🚀 Starting Bot (Clean Version)...")
+    
+    # 1. התחברות לטלגרם
+    client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
+    await client.start()
+    
+    # 2. אתחול מחלקות
+    ali = AliExpressClient(Config.APP_KEY, Config.APP_SECRET)
+    ai = AIWriter()
+    
+    # 3. מעבר על ערוצים
+    processed_count = 0
+    
+    for source in Config.SOURCE_CHANNELS:
+        logger.info(f"👀 Scanning: {source}")
+        
         try:
-            async for msg in self.client.iter_messages(self.config.tg_target_channel, limit=self.config.max_messages_per_channel):
-                if not msg.message: continue
-                
-                if msg.entities:
-                    for ent in msg.entities:
-                        if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
-                            match = re.search(r"bot-id/(\d+)", ent.url)
-                            if match: self.processed_ids.add(match.group(1))
-                
-                match_old = re.search(r"id[:\-](\d+)", msg.message)
-                if match_old: self.processed_ids.add(match_old.group(1))
-                
-        except Exception as e:
-            print(f"History load warning: {e}")
-        print(f"✅ Loaded {len(self.processed_ids)} items to ignore.")
+            # שליפת הודעות אחרונות
+            messages = await client.get_messages(source, limit=Config.MAX_MESSAGES)
+            
+            for msg in messages:
+                if not msg.text: continue
 
-    async def run(self):
-        await self.load_history()
-        print("🚀 Bot started...")
-        
-        posts_count = 0
-        
-        for channel in self.config.tg_source_channels:
-            print(f"👀 Scanning source: {channel}...")
-            try:
-                async for msg in self.client.iter_messages(channel, limit=50):
-                    if posts_count >= self.config.max_posts_per_run:
-                        print("✋ Max posts reached for this run.")
-                        return
-                    
-                    if not msg.message: continue
-
-                    urls = re.findall(r"https?://[^\s]+", msg.message)
-                    ali_url = next((u for u in urls if "aliexpress" in u or "bit.ly" in u or "s.click" in u), None)
-                    if not ali_url: continue
-
-                    real_url = resolve_url_smart(ali_url)
-                    item_id = extract_item_id(real_url)
-                    
-                    if not item_id: continue
-                    if item_id in self.processed_ids:
-                        print(f"⏭️ Duplicate found: {item_id}")
+                # חיפוש לינקים
+                links = re.findall(r'(https?://[^\s]+)', msg.text)
+                for link in links:
+                    if "aliexpress" not in link and "s.click" not in link:
                         continue
-
-                    details = self.ali.get_product_details(item_id)
+                        
+                    # פתיחת הלינק וזיהוי מוצר
+                    real_url = resolve_url(link)
+                    pid = extract_id(real_url)
+                    
+                    if not pid:
+                        continue
+                        
+                    logger.info(f"🔎 Found Product ID: {pid}")
+                    
+                    # בדיקת פרטים מול עליאקספרס
+                    details = ali.get_details(pid)
                     if not details:
-                        self.processed_ids.add(item_id) 
+                        logger.warning(f"❌ Failed to get details for {pid}")
                         continue
-
-                    try:
-                        raw_rate = details.get("evaluate_rate", "0").replace("%", "")
-                        rating = float(raw_rate)
-                        if rating > 5: rating = rating / 20 
                         
-                        orders = int(details.get("last_volume", 0))
-                        price = details.get("target_sale_price", "")
-                    except:
-                        rating = 0
-                        orders = 0
-                        price = ""
-
-                    print(f"📊 Product {item_id}: {rating}⭐ | {orders} Orders")
-
-                    if rating < self.config.min_rating:
-                        print(f"❌ Low Rating ({rating} < {self.config.min_rating}). Skip.")
-                        self.processed_ids.add(item_id)
-                        continue
-                    
-                    if orders < self.config.min_orders:
-                        print(f"❌ Low Orders ({orders} < {self.config.min_orders}). Skip.")
-                        self.processed_ids.add(item_id)
-                        continue
-
-                    aff_link = self.ali.generate_link(real_url)
+                    # יצירת לינק שותפים
+                    aff_link = ali.generate_link(real_url)
                     if not aff_link:
-                        print("❌ Failed to generate affiliate link. Skip.")
+                        logger.warning(f"❌ Failed to generate link for {pid}")
                         continue
-
-                    caption = self.writer.write_post(msg.message, price)
-                    
-                    hidden_id = f"[‎](http://bot-id/{item_id})"
-                    final_text = f"{hidden_id}{caption}\n\n👇 דיל בלעדי:\n{aff_link}"
-
-                    clean_image = details.get("product_main_image_url")
-                    
-                    try:
-                        print(f"📤 Sending Item: {item_id}...")
-                        if clean_image:
-                            await self.client.send_file(self.config.tg_target_channel, clean_image, caption=final_text)
-                        elif msg.media:
-                            await self.client.send_file(self.config.tg_target_channel, msg.media, caption=final_text)
-                        else:
-                            await self.client.send_message(self.config.tg_target_channel, final_text, link_preview=True)
                         
-                        print(f"✅ Published Item: {item_id}")
-                        self.processed_ids.add(item_id)
-                        posts_count += 1
-                        await asyncio.sleep(2)
+                    # הכנת פוסט
+                    price = details.get("target_sale_price", "") + " " + details.get("target_sale_price_currency", "ILS")
+                    title = details.get("product_title", "")
+                    caption = ai.generate(title, price)
+                    
+                    final_msg = f"{caption}\n\n👇 לפרטים ורכישה:\n{aff_link}"
+                    
+                    # שליחה
+                    img_url = details.get("product_main_image_url")
+                    try:
+                        if img_url:
+                            await client.send_file(Config.TARGET_CHANNEL, img_url, caption=final_msg)
+                        else:
+                            await client.send_message(Config.TARGET_CHANNEL, final_msg)
+                        
+                        logger.info(f"✅ Posted: {pid}")
+                        processed_count += 1
+                        time.sleep(2) # השהייה קטנה
                         
                     except Exception as e:
-                        print(f"💥 Send Error: {e}")
+                        logger.error(f"Failed to send telegram msg: {e}")
 
-            except Exception as e:
-                print(f"Error scanning channel {channel}: {e}")
+        except Exception as e:
+            logger.error(f"Error scanning channel {source}: {e}")
 
-async def main():
-    try:
-        config = Config.from_env()
-    except RuntimeError as e:
-        print(f"❌ Configuration Error: {e}")
-        return
+    logger.info(f"🏁 Done. Processed {processed_count} items.")
+    await client.disconnect()
 
-    client = TelegramClient(StringSession(config.tg_session), config.tg_api_id, config.tg_api_hash)
-    oa_client = OpenAI(api_key=config.openai_api_key)
-    
-    ali_api = AliExpressAPI(config)
-    copywriter = Copywriter(oa_client, config.openai_model)
-    
-    bot = DealBot(client, ali_api, copywriter, config)
-    
-    print("🤖 Initializing Bot...")
-    await client.start()
-    async with client:
-        await bot.run()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
