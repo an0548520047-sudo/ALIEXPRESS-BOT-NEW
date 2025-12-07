@@ -111,10 +111,11 @@ class AliExpressAPI:
     def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
         """Centralized method to handle signing and sending requests."""
         
-        # TIMEZONE ATTEMPT: PST (US West Coast) = UTC - 8
+        # TIMEZONE FIX: Beijing Time (GMT+8)
+        # This is strictly required by AliExpress Open Platform
         utc_now = datetime.utcnow()
-        pst_time = utc_now - timedelta(hours=8)
-        current_time = pst_time.strftime("%Y-%m-%d %H:%M:%S")
+        beijing_time = utc_now + timedelta(hours=8)
+        current_time = beijing_time.strftime("%Y-%m-%d %H:%M:%S")
         
         system_params = {
             "app_key": self.config.affiliate_app_key,
@@ -150,11 +151,10 @@ class AliExpressAPI:
                     print(f"🛑 API ERROR ({method}): {msg} | {sub_msg}")
                     return None
                 
-                # 2. Check ISV/Infrastructure Error (The "Unexpected JSON" culprit)
+                # 2. Check ISV/Infrastructure Error (IllegalTimestamp etc.)
                 if "code" in data and "message" in data and "request_id" in data:
-                    # This catches things like IllegalTimestamp
                     print(f"🛑 GATEWAY ERROR ({method}): Code={data.get('code')} Msg={data.get('message')}")
-                    print(f"ℹ️ Sent Timestamp: {current_time} (PST)")
+                    print(f"ℹ️ Sent Timestamp: {current_time} (Beijing/GMT+8)")
                     return None
 
                 return data
@@ -181,9 +181,8 @@ class AliExpressAPI:
 
         response_root = data.get("aliexpress_affiliate_product_detail_get_response")
         if not response_root:
-            # If we get here, it's a really weird format we haven't seen yet
             print(f"⚠️ Unexpected JSON structure for item {item_id}")
-            print(f"🐛 RAW: {json.dumps(data)}") 
+            # print(f"🐛 RAW: {json.dumps(data)}") # Uncomment if needed
             return None
 
         resp_result = response_root.get("resp_result", {})
