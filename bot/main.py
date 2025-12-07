@@ -8,7 +8,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import httpx
 from openai import OpenAI
@@ -111,11 +111,10 @@ class AliExpressAPI:
     def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
         """Centralized method to handle signing and sending requests."""
         
-        # TIMEZONE FIX: AliExpress expects GMT+8 (Beijing/Singapore Time)
-        # GitHub Actions runs on UTC, so we add 8 hours to sync with their server.
+        # TIMEZONE ATTEMPT: PST (US West Coast) = UTC - 8
         utc_now = datetime.utcnow()
-        beijing_time = utc_now + timedelta(hours=8)
-        current_time = beijing_time.strftime("%Y-%m-%d %H:%M:%S")
+        pst_time = utc_now - timedelta(hours=8)
+        current_time = pst_time.strftime("%Y-%m-%d %H:%M:%S")
         
         system_params = {
             "app_key": self.config.affiliate_app_key,
@@ -143,16 +142,21 @@ class AliExpressAPI:
                     print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}")
                     return None
 
+                # 1. Check Standard Error Response
                 if "error_response" in data:
                     err = data["error_response"]
                     msg = err.get("msg", "Unknown")
                     sub_msg = err.get("sub_msg", "No details")
                     print(f"🛑 API ERROR ({method}): {msg} | {sub_msg}")
-                    # If we still get timezone error, print raw to debug
-                    if "Timestamp" in msg or "Timestamp" in sub_msg:
-                        print(f"DEBUG TIME sent: {current_time} (Calculated as UTC+8)")
                     return None
                 
+                # 2. Check ISV/Infrastructure Error (The "Unexpected JSON" culprit)
+                if "code" in data and "message" in data and "request_id" in data:
+                    # This catches things like IllegalTimestamp
+                    print(f"🛑 GATEWAY ERROR ({method}): Code={data.get('code')} Msg={data.get('message')}")
+                    print(f"ℹ️ Sent Timestamp: {current_time} (PST)")
+                    return None
+
                 return data
 
         except Exception as e:
@@ -177,7 +181,9 @@ class AliExpressAPI:
 
         response_root = data.get("aliexpress_affiliate_product_detail_get_response")
         if not response_root:
+            # If we get here, it's a really weird format we haven't seen yet
             print(f"⚠️ Unexpected JSON structure for item {item_id}")
+            print(f"🐛 RAW: {json.dumps(data)}") 
             return None
 
         resp_result = response_root.get("resp_result", {})
