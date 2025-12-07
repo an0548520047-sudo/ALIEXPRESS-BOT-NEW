@@ -101,6 +101,7 @@ class AliExpressAPI:
     def __init__(self, config: Config):
         self.config = config
         self.base_url = "https://api-sg.aliexpress.com/router/rest"
+        self.working_offset = None  # Will store the correct timezone once found
 
     def _sign(self, params: Dict[str, str]) -> str:
         sorted_keys = sorted(params.keys())
@@ -111,7 +112,6 @@ class AliExpressAPI:
     def _send_request_with_time(self, method: str, api_params: Dict[str, str], time_offset: int) -> Optional[Dict]:
         """Helper to send request with a specific timezone offset."""
         
-        # Calculate time based on offset from UTC
         utc_now = datetime.now(timezone.utc)
         target_time = utc_now + timedelta(hours=time_offset)
         current_time_str = target_time.strftime("%Y-%m-%d %H:%M:%S")
@@ -129,7 +129,7 @@ class AliExpressAPI:
         full_params["sign"] = self._sign(full_params)
 
         try:
-            with httpx.Client(timeout=20) as client:
+            with httpx.Client(timeout=10) as client:
                 resp = client.post(
                     self.base_url, 
                     data=full_params, 
@@ -145,39 +145,48 @@ class AliExpressAPI:
                 if "error_response" in data:
                     msg = data["error_response"].get("msg", "")
                     if "IllegalTimestamp" in msg:
-                        return "RETRY" # Signal to try next timezone
-                    return None # Genuine error
+                        return "RETRY" 
+                    return None 
                 
                 # Check ISV Timestamp Error
                 if data.get("code") == "IllegalTimestamp":
                     return "RETRY"
 
+                # If we got here, the request was accepted (even if it has logic errors later)
+                # This means the TIMESTAMP was valid.
                 return data
 
         except Exception:
             return None
 
     def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
-        """Smart wrapper that tries multiple timezones."""
+        """Auto-detects the correct timezone offset."""
         
-        # 1. Try US PST (UTC-8) - Most common for global API
-        data = self._send_request_with_time(method, api_params, -8)
-        if data != "RETRY" and data is not None:
-            return data
-            
-        # 2. Try Beijing (UTC+8) - Standard for Chinese API
-        data = self._send_request_with_time(method, api_params, 8)
-        if data != "RETRY" and data is not None:
-            return data
+        # If we already found a working offset, use it directly
+        if self.working_offset is not None:
+            data = self._send_request_with_time(method, api_params, self.working_offset)
+            if data != "RETRY":
+                return data
+            # If it failed again, reset and search again (clock drift?)
+            print("⚠️ Saved timezone failed. Re-scanning...")
+            self.working_offset = None
 
-        # 3. Try UTC (0) - Fallback
-        data = self._send_request_with_time(method, api_params, 0)
+        # List of candidate offsets to try: 
+        # UTC, Beijing(+8), PST(-8), CET(+1), EST(-5)
+        candidates = [0, 8, -8, 1, -5]
         
-        if data == "RETRY":
-            print(f"🛑 ALL TIMEZONES FAILED for {method}. Check Server Clock.")
-            return None
+        print(f"🔄 Scanning timezones for {method}...")
+        
+        for offset in candidates:
+            data = self._send_request_with_time(method, api_params, offset)
             
-        return data
+            if data is not None and data != "RETRY":
+                print(f"✅ FOUND WORKING TIMEZONE: UTC{'+' if offset >=0 else ''}{offset}")
+                self.working_offset = offset # Lock it!
+                return data
+        
+        print(f"🛑 CRITICAL: All timezones failed. Server clock is likely wildly off.")
+        return None
 
     def get_product_details(self, item_id: str) -> Dict | None:
         print(f"🔍 Checking quality for item: {item_id}")
