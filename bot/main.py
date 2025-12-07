@@ -8,7 +8,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from openai import OpenAI
@@ -109,7 +109,13 @@ class AliExpressAPI:
         return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
     def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        """Centralized method to handle signing and sending requests."""
+        
+        # TIMEZONE FIX: AliExpress expects GMT+8 (Beijing/Singapore Time)
+        # GitHub Actions runs on UTC, so we add 8 hours to sync with their server.
+        utc_now = datetime.utcnow()
+        beijing_time = utc_now + timedelta(hours=8)
+        current_time = beijing_time.strftime("%Y-%m-%d %H:%M:%S")
         
         system_params = {
             "app_key": self.config.affiliate_app_key,
@@ -139,7 +145,12 @@ class AliExpressAPI:
 
                 if "error_response" in data:
                     err = data["error_response"]
-                    print(f"🛑 API ERROR ({method}): {err.get('msg')} | {err.get('sub_msg')}")
+                    msg = err.get("msg", "Unknown")
+                    sub_msg = err.get("sub_msg", "No details")
+                    print(f"🛑 API ERROR ({method}): {msg} | {sub_msg}")
+                    # If we still get timezone error, print raw to debug
+                    if "Timestamp" in msg or "Timestamp" in sub_msg:
+                        print(f"DEBUG TIME sent: {current_time} (Calculated as UTC+8)")
                     return None
                 
                 return data
@@ -164,18 +175,15 @@ class AliExpressAPI:
         if not data:
             return None
 
-        # --- DEBUG SECTION ---
-        # This will print the RAW data if the structure is wrong
-        # ---------------------
         response_root = data.get("aliexpress_affiliate_product_detail_get_response")
         if not response_root:
             print(f"⚠️ Unexpected JSON structure for item {item_id}")
-            print(f"🐛 RAW DATA FROM ALIEXPRESS: {json.dumps(data)}") # <--- IMPORTANT DEBUG
             return None
 
         resp_result = response_root.get("resp_result", {})
         if resp_result.get("resp_code") != 200:
-            print(f"⚠️ Logic Error (Item {item_id}): {resp_result.get('resp_msg')}")
+            msg = resp_result.get("resp_msg", "Unknown Logic Error")
+            print(f"⚠️ Logic Error (Item {item_id}): {msg}")
             return None
 
         result_data = resp_result.get("result")
@@ -191,10 +199,12 @@ class AliExpressAPI:
             return None
 
     def generate_link(self, url: str) -> str | None:
+        track_id = f"tg_bot_{datetime.now().strftime('%m%d')}"
+        
         params = {
             "urls": url,
             "promotion_link_type": "2",
-            "tracking_id": f"tg_bot_{datetime.now().strftime('%m%d')}"
+            "tracking_id": track_id
         }
 
         method_name = "aliexpress.affiliate.link.generate"
@@ -204,13 +214,15 @@ class AliExpressAPI:
             return None
 
         if "aliexpress_affiliate_link_generate_response" in data:
-            res = data["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]
-            if "promotion_links" in res and res["promotion_links"]["promotion_link"]:
-                return res["promotion_links"]["promotion_link"][0]["promotion_link"]
-        else:
-            print(f"⚠️ Link Gen Structure Mismatch")
-            print(f"🐛 RAW LINK DATA: {json.dumps(data)}") # <--- IMPORTANT DEBUG
+            root = data["aliexpress_affiliate_link_generate_response"]
+            res = root.get("resp_result", {}).get("result", {})
             
+            if "promotion_links" in res:
+                promos = res["promotion_links"].get("promotion_link")
+                if promos and len(promos) > 0:
+                    return promos[0]["promotion_link"]
+        
+        print(f"⚠️ Link Gen Structure Mismatch or No Link Returned")
         return None
 
 # =======================
@@ -307,7 +319,6 @@ class DealBot:
                         print(f"⏭️ Duplicate found: {item_id}")
                         continue
 
-                    # Call API with Debugging
                     details = self.ali.get_product_details(item_id)
                     if not details:
                         self.processed_ids.add(item_id) 
