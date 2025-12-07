@@ -8,7 +8,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from openai import OpenAI
@@ -108,18 +108,17 @@ class AliExpressAPI:
         s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
         return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
-    def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
-        """Centralized method to handle signing and sending requests."""
+    def _send_request_with_time(self, method: str, api_params: Dict[str, str], time_offset: int) -> Optional[Dict]:
+        """Helper to send request with a specific timezone offset."""
         
-        # TIMEZONE FIX: Beijing Time (GMT+8)
-        # This is strictly required by AliExpress Open Platform
-        utc_now = datetime.utcnow()
-        beijing_time = utc_now + timedelta(hours=8)
-        current_time = beijing_time.strftime("%Y-%m-%d %H:%M:%S")
+        # Calculate time based on offset from UTC
+        utc_now = datetime.now(timezone.utc)
+        target_time = utc_now + timedelta(hours=time_offset)
+        current_time_str = target_time.strftime("%Y-%m-%d %H:%M:%S")
         
         system_params = {
             "app_key": self.config.affiliate_app_key,
-            "timestamp": current_time,
+            "timestamp": current_time_str,
             "sign_method": "md5",
             "method": method,
             "format": "json",
@@ -140,28 +139,45 @@ class AliExpressAPI:
                 try:
                     data = resp.json()
                 except json.JSONDecodeError:
-                    print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}")
                     return None
 
-                # 1. Check Standard Error Response
+                # Check for Timestamp Error specifically
                 if "error_response" in data:
-                    err = data["error_response"]
-                    msg = err.get("msg", "Unknown")
-                    sub_msg = err.get("sub_msg", "No details")
-                    print(f"🛑 API ERROR ({method}): {msg} | {sub_msg}")
-                    return None
+                    msg = data["error_response"].get("msg", "")
+                    if "IllegalTimestamp" in msg:
+                        return "RETRY" # Signal to try next timezone
+                    return None # Genuine error
                 
-                # 2. Check ISV/Infrastructure Error (IllegalTimestamp etc.)
-                if "code" in data and "message" in data and "request_id" in data:
-                    print(f"🛑 GATEWAY ERROR ({method}): Code={data.get('code')} Msg={data.get('message')}")
-                    print(f"ℹ️ Sent Timestamp: {current_time} (Beijing/GMT+8)")
-                    return None
+                # Check ISV Timestamp Error
+                if data.get("code") == "IllegalTimestamp":
+                    return "RETRY"
 
                 return data
 
-        except Exception as e:
-            print(f"⚠️ Connection Exception: {e}")
+        except Exception:
             return None
+
+    def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
+        """Smart wrapper that tries multiple timezones."""
+        
+        # 1. Try US PST (UTC-8) - Most common for global API
+        data = self._send_request_with_time(method, api_params, -8)
+        if data != "RETRY" and data is not None:
+            return data
+            
+        # 2. Try Beijing (UTC+8) - Standard for Chinese API
+        data = self._send_request_with_time(method, api_params, 8)
+        if data != "RETRY" and data is not None:
+            return data
+
+        # 3. Try UTC (0) - Fallback
+        data = self._send_request_with_time(method, api_params, 0)
+        
+        if data == "RETRY":
+            print(f"🛑 ALL TIMEZONES FAILED for {method}. Check Server Clock.")
+            return None
+            
+        return data
 
     def get_product_details(self, item_id: str) -> Dict | None:
         print(f"🔍 Checking quality for item: {item_id}")
@@ -182,7 +198,6 @@ class AliExpressAPI:
         response_root = data.get("aliexpress_affiliate_product_detail_get_response")
         if not response_root:
             print(f"⚠️ Unexpected JSON structure for item {item_id}")
-            # print(f"🐛 RAW: {json.dumps(data)}") # Uncomment if needed
             return None
 
         resp_result = response_root.get("resp_result", {})
