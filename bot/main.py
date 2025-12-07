@@ -23,12 +23,10 @@ from telethon.tl.types import MessageEntityTextUrl
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value or not value.strip():
-        # Fallback logic
         alt = name.replace("API_", "")
         value = os.getenv(alt) or os.getenv(name.replace("ALIEXPRESS_", "AFFILIATE_"))
         
         if not value or not value.strip():
-            # Critical check
             if any(x in name for x in ["APP_KEY", "SESSION", "HASH", "API_ID"]):
                 raise RuntimeError(f"Missing required env: {name}")
             return ""
@@ -78,26 +76,20 @@ class Config:
 
 def resolve_url_smart(url: str) -> str:
     """Follows redirects to get the real product URL."""
-    # If it's already a clean item URL, return it
     if "aliexpress" in url and "s.click" not in url and "/item/" in url:
         return url
-    
     try:
         with httpx.Client(timeout=10, follow_redirects=True) as client:
             resp = client.head(url, follow_redirects=True)
             final_url = str(resp.url)
-            # Normalize mobile links to desktop
             return final_url.replace("m.aliexpress", "www.aliexpress")
     except:
         return url
 
 def extract_item_id(url: str) -> str | None:
     """Extracts the numeric item ID from the URL."""
-    # Pattern 1: Standard .html
     match = re.search(r"/item/(\d+)\.html", url)
     if match: return match.group(1)
-    
-    # Pattern 2: Just a long number sequence (fallback)
     match = re.search(r"(\d{10,})", url)
     return match.group(1) if match else None
 
@@ -111,17 +103,12 @@ class AliExpressAPI:
         self.base_url = "https://api-sg.aliexpress.com/router/rest"
 
     def _sign(self, params: Dict[str, str]) -> str:
-        # Sort parameters alphabetically
         sorted_keys = sorted(params.keys())
-        # Create string: secret + key1value1key2value2... + secret
         s = "".join([f"{k}{params[k]}" for k in sorted_keys])
         s = f"{self.config.affiliate_app_secret}{s}{self.config.affiliate_app_secret}"
-        # MD5 Hash and Upper case
         return hashlib.md5(s.encode("utf-8")).hexdigest().upper()
 
     def _send_request(self, method: str, api_params: Dict[str, str]) -> Optional[Dict]:
-        """Centralized method to handle signing and sending requests."""
-        # Using specific format for router/rest
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         system_params = {
@@ -133,10 +120,7 @@ class AliExpressAPI:
             "v": "2.0"
         }
         
-        # Merge system params with specific API params
         full_params = {**system_params, **api_params}
-        
-        # Sign the request
         full_params["sign"] = self._sign(full_params)
 
         try:
@@ -153,12 +137,9 @@ class AliExpressAPI:
                     print(f"⚠️ Critical: API returned non-JSON. Status: {resp.status_code}")
                     return None
 
-                # Check for top-level errors from AliExpress
                 if "error_response" in data:
                     err = data["error_response"]
-                    msg = err.get("msg", "Unknown")
-                    sub_msg = err.get("sub_msg", "No details")
-                    print(f"🛑 API ERROR ({method}): {msg} | {sub_msg}")
+                    print(f"🛑 API ERROR ({method}): {err.get('msg')} | {err.get('sub_msg')}")
                     return None
                 
                 return data
@@ -177,23 +158,24 @@ class AliExpressAPI:
             "tracking_id": "bot_check"
         }
 
-        # Safe string for method name
         method_name = "aliexpress.affiliate.product.detail.get"
-        
         data = self._send_request(method_name, params)
+        
         if not data:
             return None
 
-        # Navigate the JSON response safely
+        # --- DEBUG SECTION ---
+        # This will print the RAW data if the structure is wrong
+        # ---------------------
         response_root = data.get("aliexpress_affiliate_product_detail_get_response")
         if not response_root:
             print(f"⚠️ Unexpected JSON structure for item {item_id}")
+            print(f"🐛 RAW DATA FROM ALIEXPRESS: {json.dumps(data)}") # <--- IMPORTANT DEBUG
             return None
 
         resp_result = response_root.get("resp_result", {})
         if resp_result.get("resp_code") != 200:
-            msg = resp_result.get("resp_msg", "Unknown Logic Error")
-            print(f"⚠️ Logic Error (Item {item_id}): {msg}")
+            print(f"⚠️ Logic Error (Item {item_id}): {resp_result.get('resp_msg')}")
             return None
 
         result_data = resp_result.get("result")
@@ -209,31 +191,26 @@ class AliExpressAPI:
             return None
 
     def generate_link(self, url: str) -> str | None:
-        # Generate a unique tracking ID based on date
-        track_id = f"tg_bot_{datetime.now().strftime('%m%d')}"
-        
         params = {
             "urls": url,
-            "promotion_link_type": "2", # 2 = Hot Link (Best for affiliates)
-            "tracking_id": track_id
+            "promotion_link_type": "2",
+            "tracking_id": f"tg_bot_{datetime.now().strftime('%m%d')}"
         }
 
         method_name = "aliexpress.affiliate.link.generate"
-        
         data = self._send_request(method_name, params)
+        
         if not data:
             return None
 
         if "aliexpress_affiliate_link_generate_response" in data:
-            root = data["aliexpress_affiliate_link_generate_response"]
-            res = root.get("resp_result", {}).get("result", {})
+            res = data["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]
+            if "promotion_links" in res and res["promotion_links"]["promotion_link"]:
+                return res["promotion_links"]["promotion_link"][0]["promotion_link"]
+        else:
+            print(f"⚠️ Link Gen Structure Mismatch")
+            print(f"🐛 RAW LINK DATA: {json.dumps(data)}") # <--- IMPORTANT DEBUG
             
-            if "promotion_links" in res:
-                promos = res["promotion_links"].get("promotion_link")
-                if promos and len(promos) > 0:
-                    return promos[0]["promotion_link"]
-        
-        print(f"⚠️ Link Gen Structure Mismatch or No Link Returned")
         return None
 
 # =======================
@@ -246,8 +223,6 @@ class Copywriter:
         self.model = model
 
     def write_post(self, original_text: str, price: str = "") -> str:
-        # Building the prompt safely using tuple concatenation
-        # This prevents syntax errors with multi-line strings
         prompt_parts = (
             "אתה קופירייטר ישראלי מומחה לשיווק בטלגרם.\n",
             "המטרה: לכתוב פוסט קצר, דחוף ואנרגטי שגורם לאנשים להקליק ולקנות מיד.\n",
@@ -291,14 +266,12 @@ class DealBot:
             async for msg in self.client.iter_messages(self.config.tg_target_channel, limit=self.config.max_messages_per_channel):
                 if not msg.message: continue
                 
-                # Check for hidden ID in entities (cleaner way)
                 if msg.entities:
                     for ent in msg.entities:
                         if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
                             match = re.search(r"bot-id/(\d+)", ent.url)
                             if match: self.processed_ids.add(match.group(1))
                 
-                # Check for visible ID in text (legacy way)
                 match_old = re.search(r"id[:\-](\d+)", msg.message)
                 if match_old: self.processed_ids.add(match_old.group(1))
                 
@@ -315,7 +288,6 @@ class DealBot:
         for channel in self.config.tg_source_channels:
             print(f"👀 Scanning source: {channel}...")
             try:
-                # Iterate messages
                 async for msg in self.client.iter_messages(channel, limit=50):
                     if posts_count >= self.config.max_posts_per_run:
                         print("✋ Max posts reached for this run.")
@@ -323,36 +295,27 @@ class DealBot:
                     
                     if not msg.message: continue
 
-                    # Regex to find links
                     urls = re.findall(r"https?://[^\s]+", msg.message)
                     ali_url = next((u for u in urls if "aliexpress" in u or "bit.ly" in u or "s.click" in u), None)
-                    
                     if not ali_url: continue
 
-                    # 1. Resolve to full URL
                     real_url = resolve_url_smart(ali_url)
-                    
-                    # 2. Extract ID
                     item_id = extract_item_id(real_url)
-                    if not item_id: continue
                     
-                    # 3. Duplicate check
+                    if not item_id: continue
                     if item_id in self.processed_ids:
                         print(f"⏭️ Duplicate found: {item_id}")
                         continue
 
-                    # 4. Get Details & Quality Check
+                    # Call API with Debugging
                     details = self.ali.get_product_details(item_id)
                     if not details:
-                        # Mark as processed so we don't spam API for broken items
                         self.processed_ids.add(item_id) 
                         continue
 
-                    # Safely parse numbers
                     try:
                         raw_rate = details.get("evaluate_rate", "0").replace("%", "")
                         rating = float(raw_rate)
-                        # Fix percentage vs 5-star scale
                         if rating > 5: rating = rating / 20 
                         
                         orders = int(details.get("last_volume", 0))
@@ -364,7 +327,6 @@ class DealBot:
 
                     print(f"📊 Product {item_id}: {rating}⭐ | {orders} Orders")
 
-                    # Apply Filters
                     if rating < self.config.min_rating:
                         print(f"❌ Low Rating ({rating} < {self.config.min_rating}). Skip.")
                         self.processed_ids.add(item_id)
@@ -375,22 +337,18 @@ class DealBot:
                         self.processed_ids.add(item_id)
                         continue
 
-                    # 5. Generate Affiliate Link
                     aff_link = self.ali.generate_link(real_url)
                     if not aff_link:
                         print("❌ Failed to generate affiliate link. Skip.")
                         continue
 
-                    # 6. Generate Content
                     caption = self.writer.write_post(msg.message, price)
                     
-                    # Hidden ID for history tracking
                     hidden_id = f"[‎](http://bot-id/{item_id})"
                     final_text = f"{hidden_id}{caption}\n\n👇 דיל בלעדי:\n{aff_link}"
 
                     clean_image = details.get("product_main_image_url")
                     
-                    # 7. Send Post
                     try:
                         print(f"📤 Sending Item: {item_id}...")
                         if clean_image:
@@ -403,8 +361,6 @@ class DealBot:
                         print(f"✅ Published Item: {item_id}")
                         self.processed_ids.add(item_id)
                         posts_count += 1
-                        
-                        # Sleep to respect rate limits
                         await asyncio.sleep(2)
                         
                     except Exception as e:
