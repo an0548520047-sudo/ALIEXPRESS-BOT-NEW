@@ -38,7 +38,6 @@ class Config:
     OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
     MAX_MESSAGES = 30
 
-# בדיקת משתנים קריטיים
 if not Config.APP_KEY or not Config.APP_SECRET:
     logger.critical("❌ Missing ALIEXPRESS_APP_KEY or ALIEXPRESS_APP_SECRET")
     sys.exit(1)
@@ -73,46 +72,54 @@ class AliExpressClient:
         all_params = {**sys_params, **api_params}
         all_params["sign"] = self._generate_sign(all_params)
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
 
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=20.0) as client:
                 response = client.post(self.gateway, data=all_params, headers=headers)
                 data = response.json()
                 
-                # --- דיבאג קריטי: הדפסת התשובה המלאה במקרה של שגיאה ---
                 if "error_response" in data:
                     logger.error(f"⚠️ API Error Response: {json.dumps(data)}")
                     return None
-                # --------------------------------------------------------
-                
                 return data
         except Exception as e:
             logger.error(f"Network Error: {e}")
             return None
 
     def get_details(self, product_id):
+        # תיקון קריטי: בקשת שדות ספציפיים
+        fields = "product_id,product_title,product_video_url,product_main_image_url,target_sale_price,target_sale_price_currency,evaluate_rate,last_volume"
+        
         params = {
             "product_ids": product_id,
             "target_currency": "ILS",
-            "target_language": "HE"
+            "target_language": "HE",
+            "fields": fields 
         }
+        
         res = self.execute("aliexpress.affiliate.product.detail.get", params)
         if not res: return None
         
         try:
-            # בדיקה אם רשימת המוצרים ריקה (קורה כשהמוצר לא זמין או לא קיים)
-            products_list = res.get("aliexpress_affiliate_product_detail_get_response", {}).get("resp_result", {}).get("result", {}).get("products", {}).get("product")
+            resp_result = res.get("aliexpress_affiliate_product_detail_get_response", {}).get("resp_result", {})
             
-            if not products_list:
-                logger.warning(f"⚠️ No product details found for ID: {product_id} (Maybe restricted or invalid)")
-                return None
+            # בדיקת קוד הצלחה פנימי
+            if resp_result.get("resp_code") == 200:
+                result = resp_result.get("result", {})
+                products = result.get("products", {}).get("product")
                 
-            return products_list[0]
+                if products:
+                    return products[0]
+                else:
+                    logger.warning(f"⚠️ Empty product list for ID: {product_id}. Raw Result: {json.dumps(result)}")
+                    return None
+            else:
+                 logger.warning(f"⚠️ Business Logic Error for {product_id}: {resp_result.get('resp_msg')}")
+                 return None
+
         except Exception as e:
-            logger.error(f"Parsing Error: {e} | Raw Data: {str(res)[:200]}")
+            logger.error(f"Parsing Error: {e} | Raw Data: {str(res)[:500]}")
             return None
 
     def generate_link(self, original_url):
@@ -141,15 +148,10 @@ def extract_id(url):
 
 def resolve_url(url):
     try:
-        # הוספת headers כדי לעקוף חסימות בסיסיות של עליאקספרס
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"}
         with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
             resp = client.head(url)
-            # אם קיבלנו שגיאה 502 (כמו בלוג שלך), נחזיר את הכתובת המקורית וננסה
-            if resp.status_code >= 400:
-                return url
+            if resp.status_code >= 400: return url
             return str(resp.url).split('?')[0]
     except:
         return url
@@ -171,23 +173,19 @@ class AIWriter:
             return "דיל שווה בטירוף! אל תפספסו 👇"
 
 async def main():
-    logger.info("🚀 Starting Bot (Debug Mode)...")
+    logger.info("🚀 Starting Bot (Field Fix)...")
     
     try:
         client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
         await client.start()
     except Exception as e:
-        logger.critical(f"Login Failed: {e}. Please regenerate TG_SESSION!")
+        logger.critical(f"Login Failed: {e}")
         sys.exit(1)
 
     ali = AliExpressClient(Config.APP_KEY, Config.APP_SECRET)
     ai = AIWriter()
     
     processed_count = 0
-    
-    # בדיקת חיבור בסיסית - לוודא שאנחנו לא רצים על ריק
-    logger.info(f"Target Channel: {Config.TARGET_CHANNEL}")
-    
     for source in Config.SOURCE_CHANNELS:
         logger.info(f"👀 Scanning: {source}")
         try:
@@ -203,27 +201,24 @@ async def main():
                     if not pid: continue
                     
                     logger.info(f"🔎 Found ID: {pid}")
-                    
-                    # שלב 1: משיכת פרטים
                     details = ali.get_details(pid)
                     if not details: 
-                        logger.warning(f"⏩ Skipping {pid} - No details returned.")
+                        logger.warning(f"⏩ Skipping {pid} - Details fetch failed.")
                         continue 
                     
-                    # שלב 2: יצירת לינק
                     aff_link = ali.generate_link(real_url)
                     if not aff_link: 
-                        logger.warning(f"⏩ Skipping {pid} - Failed to generate affiliate link.")
+                        logger.warning(f"⏩ Skipping {pid} - Link gen failed.")
                         continue
                     
-                    # שלב 3: שליחה
-                    price = details.get("target_sale_price", "") + " " + details.get("target_sale_price_currency", "ILS")
-                    caption = ai.generate(details.get("product_title", ""), price)
+                    price = str(details.get("target_sale_price", "??")) + " " + str(details.get("target_sale_price_currency", "ILS"))
+                    caption = ai.generate(details.get("product_title", "מוצר חדש"), price)
                     final_msg = f"{caption}\n\n👇 לרכישה:\n{aff_link}"
                     
+                    img_url = details.get("product_main_image_url")
                     try:
-                        if details.get("product_main_image_url"):
-                            await client.send_file(Config.TARGET_CHANNEL, details.get("product_main_image_url"), caption=final_msg)
+                        if img_url:
+                            await client.send_file(Config.TARGET_CHANNEL, img_url, caption=final_msg)
                         else:
                             await client.send_message(Config.TARGET_CHANNEL, final_msg)
                         
@@ -232,11 +227,11 @@ async def main():
                         time.sleep(2)
                     except Exception as e:
                          logger.error(f"❌ Send Error: {e}")
-                         
+
         except Exception as e:
             logger.error(f"Channel Error: {e}")
 
-    logger.info(f"🏁 Done. Total posted: {processed_count}")
+    logger.info(f"🏁 Done. Total: {processed_count}")
 
 if __name__ == '__main__':
     asyncio.run(main())
