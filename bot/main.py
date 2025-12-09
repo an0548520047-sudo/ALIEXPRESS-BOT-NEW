@@ -15,7 +15,7 @@ from telethon.sessions import StringSession
 from openai import OpenAI
 
 # ==========================================
-# 1. הגדרות לוגים (שנבין מה קורה)
+# 1. הגדרות לוגים
 # ==========================================
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,31 +27,23 @@ logger = logging.getLogger(__name__)
 # 2. הגדרות קונפיגורציה
 # ==========================================
 class Config:
-    # Telegram
     API_ID = int(os.environ.get("TG_API_ID", 0))
     API_HASH = os.environ.get("TG_API_HASH")
     SESSION_STR = os.environ.get("TG_SESSION")
     SOURCE_CHANNELS = [x.strip() for x in os.environ.get("TG_SOURCE_CHANNELS", "").split(",") if x.strip()]
     TARGET_CHANNEL = os.environ.get("TG_TARGET_CHANNEL")
-
-    # AliExpress
     APP_KEY = os.environ.get("ALIEXPRESS_APP_KEY")
     APP_SECRET = os.environ.get("ALIEXPRESS_APP_SECRET")
-    
-    # OpenAI
     OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
-    
-    # הגדרות כלליות
-    MAX_MESSAGES = 40  # כמה הודעות אחרונות לסרוק מכל ערוץ
+    MAX_MESSAGES = 40
     HISTORY_FILE = "history.txt"
 
-# בדיקת חובה
 if not Config.APP_KEY or not Config.APP_SECRET:
-    logger.critical("❌ Missing ALIEXPRESS_APP_KEY or ALIEXPRESS_APP_SECRET in Secrets!")
+    logger.critical("❌ Missing Keys!")
     sys.exit(1)
 
 # ==========================================
-# 3. מחלקת עליאקספרס (הלב של הבוט)
+# 3. מחלקת עליאקספרס
 # ==========================================
 class AliExpressClient:
     def __init__(self, app_key, app_secret):
@@ -60,7 +52,6 @@ class AliExpressClient:
         self.gateway = "https://api-sg.aliexpress.com/router/rest"
 
     def _sign(self, params):
-        """יצירת חתימה דיגיטלית לפי דרישות עליאקספרס"""
         keys = sorted(params.keys())
         sign_str = self.app_secret
         for key in keys:
@@ -69,7 +60,6 @@ class AliExpressClient:
         return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
 
     def execute(self, method, api_params):
-        """שליחת בקשה לשרת"""
         sys_params = {
             "app_key": self.app_key,
             "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -88,40 +78,21 @@ class AliExpressClient:
                     data=all_params, 
                     headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
                 )
-                data = resp.json()
-                
-                if "error_response" in data:
-                    err = data["error_response"]
-                    logger.error(f"⚠️ API Error: {err.get('msg')} (Code: {err.get('code')})")
-                    return None
-                return data
+                return resp.json()
         except Exception as e:
             logger.error(f"Network Error: {e}")
             return None
 
     def get_details(self, product_id):
-        """משיכת פרטי מוצר"""
-        # אנו מבקשים דולרים כדי להימנע מבעיות "לא נשלח לישראל" שחוסמות את ה-API
-        params = {
-            "product_ids": product_id,
-            "target_currency": "USD",
-            "target_language": "EN"
-        }
+        params = {"product_ids": product_id, "target_currency": "USD", "target_language": "EN"}
         res = self.execute("aliexpress.affiliate.product.detail.get", params)
         if not res: return None
-
         try:
-            result = res["aliexpress_affiliate_product_detail_get_response"]["resp_result"]["result"]
-            products = result.get("products", {}).get("product")
-            if products:
-                return products[0]
-            logger.warning(f"⚠️ Item {product_id} exists but returned no data (Maybe sold out).")
-            return None
-        except Exception:
+            return res["aliexpress_affiliate_product_detail_get_response"]["resp_result"]["result"]["products"]["product"][0]
+        except:
             return None
 
     def generate_link(self, original_url):
-        """יצירת קישור שותפים"""
         params = {
             "promotion_link_type": "0",
             "source_values": original_url,
@@ -129,172 +100,131 @@ class AliExpressClient:
         }
         res = self.execute("aliexpress.affiliate.link.generate", params)
         if not res: return None
-
         try:
             return res["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]["promotion_links"]["promotion_link"][0]["promotion_link"]
-        except Exception:
+        except:
             return None
 
 # ==========================================
-# 4. מנוע AI (כתיבת פוסטים)
+# 4. מנוע AI
 # ==========================================
 class AIWriter:
     def __init__(self):
         self.client = OpenAI(api_key=Config.OPENAI_KEY) if Config.OPENAI_KEY else None
 
     def generate(self, title, price):
-        if not self.client:
-            return "מציאה חדשה מאליאקספרס! 👇"
-        
-        prompt = (
-            f"כתוב פוסט טלגרם קצר, שיווקי וקליט בעברית (סלנג קליל).\n"
-            f"המוצר: {title}\n"
-            f"המחיר: {price}\n"
-            f"הנחיות: כותרת עם אימוג'י, משפט התלהבות, והנעה לפעולה. בלי האשטאגים."
-        )
+        if not self.client: return "מציאה חדשה! 👇"
         try:
+            prompt = f"פוסט טלגרם קצר בעברית. מוצר: {title}. מחיר: {price}. בלי האשטאגים."
             resp = self.client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200
+                messages=[{"role": "user", "content": prompt}]
             )
             return resp.choices[0].message.content.strip()
-        except Exception:
-            return "דיל מטורף מאליאקספרס! אל תפספסו 🔥"
+        except:
+            return "דיל מטורף מאליאקספרס! 🔥"
 
 # ==========================================
-# 5. כלי עזר (קישורים ו-ID)
+# 5. כלי עזר
 # ==========================================
 def resolve_url(url):
-    """
-    פותח קיצורים וממיר קישורי US לקישורים גלובליים
-    """
     try:
-        # קוקיז שמכריחים את האתר להיות גלובלי ולא אמריקאי
-        cookies = {
-            "xman_us_f": "x_l=0&x_locale=en_US", 
-            "int_locale": "en_US",
-            "aep_usuc_f": "region=IL&site=glo&b_locale=en_US&c_tp=USD"
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36"
-        }
-        
+        cookies = {"xman_us_f": "x_l=0&x_locale=en_US", "aep_usuc_f": "region=IL&site=glo&b_locale=en_US&c_tp=USD"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36"}
         with httpx.Client(follow_redirects=True, timeout=15, headers=headers, cookies=cookies) as client:
             resp = client.head(url)
-            final_url = str(resp.url)
-            
-            # תיקון קריטי: אם הגענו ל-aliexpress.us, נחליף ל-.com
-            if "aliexpress.us" in final_url:
-                final_url = final_url.replace("aliexpress.us", "aliexpress.com")
-            
-            return final_url.split('?')[0]
-    except Exception:
+            final = str(resp.url)
+            if "aliexpress.us" in final: return final.replace("aliexpress.us", "aliexpress.com")
+            return final.split('?')[0]
+    except:
         return url
 
 def extract_id(url):
-    """מוציא את המספר המזהה מהקישור"""
-    # עדיפות לפורמט גלובלי (1005...)
     match = re.search(r'/item/(1005\d{10,})\.html', url)
     if match: return match.group(1)
-    
-    # פורמט כללי
     match = re.search(r'/item/(\d+)\.html', url)
     if match: return match.group(1)
     return None
 
 # ==========================================
-# 6. הריצה הראשית (Main)
+# 6. הריצה הראשית
 # ==========================================
 async def main():
-    logger.info("🚀 Bot Starting...")
+    logger.info("🚀 Bot Starting (Aggressive Mode)...")
     
     # טעינת היסטוריה
     processed_ids = set()
     if os.path.exists(Config.HISTORY_FILE):
         with open(Config.HISTORY_FILE, "r") as f:
             processed_ids = set(f.read().splitlines())
-    logger.info(f"📚 History loaded: {len(processed_ids)} items.")
-
-    # התחברות לטלגרם
-    try:
-        client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
-        await client.start()
-    except Exception as e:
-        logger.critical(f"❌ Telegram Login Failed: {e}")
-        sys.exit(1)
+    
+    # התחברות
+    client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
+    await client.start()
 
     ali = AliExpressClient(Config.APP_KEY, Config.APP_SECRET)
     ai = AIWriter()
     
-    new_posts_count = 0
-    
-    # סריקת ערוצים
     for channel in Config.SOURCE_CHANNELS:
-        logger.info(f"👀 Scanning source: {channel}")
+        logger.info(f"👀 Scanning: {channel}")
         try:
             messages = await client.get_messages(channel, limit=Config.MAX_MESSAGES)
-            
             for msg in messages:
                 if not msg.text: continue
-                
-                # חיפוש כל הלינקים בהודעה
                 links = re.findall(r'(https?://[^\s]+)', msg.text)
+                
                 for link in links:
                     if "aliexpress" not in link and "s.click" not in link: continue
                     
-                    # פענוח הלינק
                     real_url = resolve_url(link)
                     pid = extract_id(real_url)
                     
-                    if not pid: continue
-                    if pid in processed_ids: continue # דלג אם כבר פורסם
+                    if not pid or pid in processed_ids: continue
                     
-                    logger.info(f"🔎 Processing ID: {pid}")
+                    logger.info(f"⚡ Processing: {pid}")
                     
-                    # 1. משיכת פרטים
-                    details = ali.get_details(pid)
-                    if not details:
-                        # אם נכשל, נשמור בהיסטוריה כדי לא לנסות שוב סתם
-                        processed_ids.add(pid) 
+                    # ניסיון ליצור לינק אפיליאייט (הכי חשוב!)
+                    aff_link = ali.generate_link(real_url)
+                    if not aff_link:
+                        logger.warning(f"⏩ Failed to generate link for {pid}")
                         continue
 
-                    # 2. יצירת לינק שותפים
-                    aff_link = ali.generate_link(real_url)
-                    if not aff_link: continue
+                    # ניסיון למשוך פרטים (אופציונלי - לא עוצר אם נכשל)
+                    details = ali.get_details(pid)
                     
-                    # 3. יצירת תוכן
-                    price = f"{details.get('target_sale_price', 'Unknown')} {details.get('target_sale_price_currency', 'USD')}"
-                    title = details.get('product_title', 'מוצר מומלץ')
-                    text = ai.generate(title, price)
-                    
-                    final_msg = f"{text}\n\n👇 לרכישה:\n{aff_link}"
-                    
-                    # 4. שליחה
-                    try:
+                    if details:
+                        title = details.get('product_title', 'מוצר מומלץ')
+                        price = f"{details.get('target_sale_price', '')} USD"
                         img = details.get("product_main_image_url")
+                    else:
+                        # אם אין פרטים, ננסה לקחת מהודעת המקור או נשים ברירת מחדל
+                        title = "מציאה מאליאקספרס"
+                        price = "מחיר מעולה"
+                        img = None # נשלח הודעת טקסט בלבד
+                    
+                    text = ai.generate(title, price)
+                    final_msg = f"{text}\n\n👇 לרכישה:\n{aff_link}"
+
+                    try:
                         if img:
                             await client.send_file(Config.TARGET_CHANNEL, img, caption=final_msg)
+                        elif msg.media: # ננסה להשתמש בתמונה מההודעה המקורית
+                            await client.send_file(Config.TARGET_CHANNEL, msg.media, caption=final_msg)
                         else:
-                            await client.send_message(Config.TARGET_CHANNEL, final_msg)
-                            
-                        logger.info(f"✅ Posted successfully: {pid}")
+                            await client.send_message(Config.TARGET_CHANNEL, final_msg, link_preview=True)
                         
-                        # עדכון היסטוריה
+                        logger.info(f"✅ POSTED: {pid}")
                         processed_ids.add(pid)
-                        new_posts_count += 1
-                        with open(Config.HISTORY_FILE, "a") as f:
-                            f.write(f"{pid}\n")
-                        
-                        time.sleep(3) # מנוחה קצרה
-                        
+                        with open(Config.HISTORY_FILE, "a") as f: f.write(f"{pid}\n")
+                        time.sleep(3)
                     except Exception as e:
                         logger.error(f"❌ Send Error: {e}")
 
         except Exception as e:
-            logger.error(f"Error reading channel {channel}: {e}")
+            logger.error(f"Channel Error: {e}")
 
-    logger.info(f"🏁 Run finished. Posted {new_posts_count} new items.")
+    # שמירה וסיום
+    logger.info("🏁 Done.")
 
 if __name__ == '__main__':
     asyncio.run(main())
