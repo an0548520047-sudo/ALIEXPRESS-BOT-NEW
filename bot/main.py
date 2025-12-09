@@ -44,13 +44,12 @@ if not Config.APP_KEY or not Config.APP_SECRET:
     sys.exit(1)
 
 # ==========================================
-# מחלקת עליאקספרס (מתוקנת - REST Endpoint)
+# מחלקת עליאקספרס
 # ==========================================
 class AliExpressClient:
     def __init__(self, app_key, app_secret):
         self.app_key = app_key
         self.app_secret = app_secret
-        # שינוי קריטי: מעבר ל-router/rest שהוא הסטנדרט היציב יותר
         self.gateway = "https://api-sg.aliexpress.com/router/rest"
 
     def _generate_sign(self, params):
@@ -83,10 +82,12 @@ class AliExpressClient:
                 response = client.post(self.gateway, data=all_params, headers=headers)
                 data = response.json()
                 
-                # בדיקת שגיאות גלובלית
+                # --- דיבאג קריטי: הדפסת התשובה המלאה במקרה של שגיאה ---
                 if "error_response" in data:
-                    logger.error(f"⚠️ API Error: {data['error_response'].get('msg')} (Code: {data['error_response'].get('code')})")
+                    logger.error(f"⚠️ API Error Response: {json.dumps(data)}")
                     return None
+                # --------------------------------------------------------
+                
                 return data
         except Exception as e:
             logger.error(f"Network Error: {e}")
@@ -102,8 +103,16 @@ class AliExpressClient:
         if not res: return None
         
         try:
-            return res["aliexpress_affiliate_product_detail_get_response"]["resp_result"]["result"]["products"]["product"][0]
-        except:
+            # בדיקה אם רשימת המוצרים ריקה (קורה כשהמוצר לא זמין או לא קיים)
+            products_list = res.get("aliexpress_affiliate_product_detail_get_response", {}).get("resp_result", {}).get("result", {}).get("products", {}).get("product")
+            
+            if not products_list:
+                logger.warning(f"⚠️ No product details found for ID: {product_id} (Maybe restricted or invalid)")
+                return None
+                
+            return products_list[0]
+        except Exception as e:
+            logger.error(f"Parsing Error: {e} | Raw Data: {str(res)[:200]}")
             return None
 
     def generate_link(self, original_url):
@@ -132,8 +141,15 @@ def extract_id(url):
 
 def resolve_url(url):
     try:
-        with httpx.Client(follow_redirects=True, timeout=10) as client:
+        # הוספת headers כדי לעקוף חסימות בסיסיות של עליאקספרס
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+        }
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
             resp = client.head(url)
+            # אם קיבלנו שגיאה 502 (כמו בלוג שלך), נחזיר את הכתובת המקורית וננסה
+            if resp.status_code >= 400:
+                return url
             return str(resp.url).split('?')[0]
     except:
         return url
@@ -155,10 +171,7 @@ class AIWriter:
             return "דיל שווה בטירוף! אל תפספסו 👇"
 
 async def main():
-    logger.info("🚀 Starting Bot (Final REST Fix)...")
-    
-    # הדפסת דיבאג (חלקית, לא לחשוף סודות מלאים)
-    logger.info(f"App Key Length: {len(Config.APP_KEY) if Config.APP_KEY else 0}")
+    logger.info("🚀 Starting Bot (Debug Mode)...")
     
     try:
         client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
@@ -171,6 +184,10 @@ async def main():
     ai = AIWriter()
     
     processed_count = 0
+    
+    # בדיקת חיבור בסיסית - לוודא שאנחנו לא רצים על ריק
+    logger.info(f"Target Channel: {Config.TARGET_CHANNEL}")
+    
     for source in Config.SOURCE_CHANNELS:
         logger.info(f"👀 Scanning: {source}")
         try:
@@ -186,28 +203,40 @@ async def main():
                     if not pid: continue
                     
                     logger.info(f"🔎 Found ID: {pid}")
+                    
+                    # שלב 1: משיכת פרטים
                     details = ali.get_details(pid)
-                    if not details: continue 
+                    if not details: 
+                        logger.warning(f"⏩ Skipping {pid} - No details returned.")
+                        continue 
                     
+                    # שלב 2: יצירת לינק
                     aff_link = ali.generate_link(real_url)
-                    if not aff_link: continue
+                    if not aff_link: 
+                        logger.warning(f"⏩ Skipping {pid} - Failed to generate affiliate link.")
+                        continue
                     
+                    # שלב 3: שליחה
                     price = details.get("target_sale_price", "") + " " + details.get("target_sale_price_currency", "ILS")
                     caption = ai.generate(details.get("product_title", ""), price)
                     final_msg = f"{caption}\n\n👇 לרכישה:\n{aff_link}"
                     
-                    if details.get("product_main_image_url"):
-                        await client.send_file(Config.TARGET_CHANNEL, details.get("product_main_image_url"), caption=final_msg)
-                    else:
-                        await client.send_message(Config.TARGET_CHANNEL, final_msg)
-                    
-                    logger.info(f"✅ Posted: {pid}")
-                    processed_count += 1
-                    time.sleep(2)
+                    try:
+                        if details.get("product_main_image_url"):
+                            await client.send_file(Config.TARGET_CHANNEL, details.get("product_main_image_url"), caption=final_msg)
+                        else:
+                            await client.send_message(Config.TARGET_CHANNEL, final_msg)
+                        
+                        logger.info(f"✅ Posted: {pid}")
+                        processed_count += 1
+                        time.sleep(2)
+                    except Exception as e:
+                         logger.error(f"❌ Send Error: {e}")
+                         
         except Exception as e:
             logger.error(f"Channel Error: {e}")
 
-    logger.info("🏁 Done.")
+    logger.info(f"🏁 Done. Total posted: {processed_count}")
 
 if __name__ == '__main__':
     asyncio.run(main())
