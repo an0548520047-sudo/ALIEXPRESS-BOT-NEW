@@ -6,9 +6,8 @@ import time
 import hashlib
 import logging
 import random
-from datetime import datetime, time as dt_time
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlunparse
-import pytz
 
 import httpx
 from openai import OpenAI
@@ -41,12 +40,11 @@ class Config:
 
     # הגדרות ריצה
     MAX_MESSAGES = 50       
-    MAX_POSTS_PER_RUN = 8   # הורדתי קצת כדי לשמור על איכות
-    MIN_DELAY = 5           # מינימום שניות בין פוסטים
+    MAX_POSTS_PER_RUN = 8
+    MIN_DELAY = 5
     
-    # שעות פעילות (שעון ישראל) - אופציונלי, כרגע 24/7 אבל מוכן לשימוש
-    QUIET_HOURS_START = 2   # 02:00 בלילה
-    QUIET_HOURS_END = 6     # 06:00 בבוקר
+    # שעות פעילות (השתקתי כרגע כדי למנוע סיבוכים, אבל המבנה מוכן)
+    # אפשר להחזיר אם תרצה בעתיד
 
     @staticmethod
     def validate():
@@ -75,13 +73,11 @@ class AliExpressHandler:
     def clean_url(self, url):
         """מנקה פרמטרים ומחלץ ID"""
         try:
-            # פתיחת קיצורים חכמה - רק אם צריך
             if any(x in url for x in ['bit.ly', 't.me', 'tinyurl', 's.click']):
                 with httpx.Client(follow_redirects=True, timeout=10) as client:
                     resp = client.head(url)
                     url = str(resp.url)
 
-            # חילוץ ID - השיטה הכי אמינה
             match = re.search(r'/item/(\d+)\.html', url)
             if match:
                 return f"https://www.aliexpress.com/item/{match.group(1)}.html", match.group(1)
@@ -121,21 +117,17 @@ class AliExpressHandler:
         except Exception as e:
             logger.error(f"API Error: {e}")
         
-        # אם נכשל, מחזירים את הלינק הנקי כדי לא לאבד את הפוסט
         return clean_link
 
 # ==========================================
-# 3. מחלקת תוכן (AI) - משופרת
+# 3. מחלקת תוכן (AI)
 # ==========================================
 class ContentGenerator:
     def __init__(self):
         self.client = OpenAI(api_key=Config.OPENAI_KEY) if Config.OPENAI_KEY else None
 
     def _sanitize_input(self, text):
-        """מנקה זבל מהודעות מקור לפני שליחה ל-AI"""
-        # מחיקת לינקים מהטקסט (הם סתם מבלבלים את ה-GPT)
         text = re.sub(r'https?://\S+', '', text)
-        # מחיקת שורות "הצטרפו לערוץ" נפוצות
         bad_words = ["הצטרפו", "ערוץ", "join", "channel", "t.me", "@"]
         lines = [line for line in text.split('\n') if not any(bw in line.lower() for bw in bad_words)]
         return "\n".join(lines).strip()
@@ -146,7 +138,6 @@ class ContentGenerator:
 
         clean_text = self._sanitize_input(original_text)
         
-        # אם נשאר מעט מדי טקסט, נבקש גנרי
         if len(clean_text) < 10:
             prompt = f"כתוב משפט שיווקי קצר על 'גאדג'ט מאליאקספרס'. מחיר: {price_hint}."
         else:
@@ -179,18 +170,15 @@ class AffiliateBot:
         self.history = set()
 
     async def load_history(self):
-        """טעינת היסטוריה חכמה"""
         logger.info("📚 Loading history...")
         try:
             async for msg in self.client.iter_messages(Config.TARGET_CHANNEL, limit=200):
-                # זיהוי ID נסתר
                 if msg.entities:
                     for ent in msg.entities:
                         if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
                             match = re.search(r"bot-id/(\d+)", ent.url)
                             if match: self.history.add(match.group(1))
                 
-                # תמיכה לאחור
                 if msg.text:
                     links = re.findall(r'/item/(\d+)\.html', msg.text)
                     for pid in links: self.history.add(pid)
@@ -213,14 +201,12 @@ class AffiliateBot:
             logger.info(f"👀 Scanning: {source}")
             try:
                 async for msg in self.client.iter_messages(source, limit=Config.MAX_MESSAGES):
-                    # הגנה מפני הצפה
                     if processed_count >= Config.MAX_POSTS_PER_RUN:
                         logger.info("🛑 Reached limits. Bye.")
                         return
 
                     if not msg.text: continue
                     
-                    # זיהוי לינקים
                     urls = re.findall(r'(https?://[^\s]+)', msg.text)
                     valid_urls = [u for u in urls if "aliexpress" in u or "s.click" in u or "bit.ly" in u]
                     
@@ -229,15 +215,12 @@ class AffiliateBot:
                     original_link = valid_urls[0]
                     _, pid = self.ali.clean_url(original_link)
                     
-                    # בדיקת כפילות ראשונית
                     if pid and pid in self.history: continue 
 
                     logger.info(f"🔎 Found deal: {pid or 'Unknown'}")
                     
-                    # המרה ללינק אפיליאייט
                     final_link = self.ali.generate_affiliate_link(original_link)
                     
-                    # בדיקה סופית של ה-ID אחרי המרה
                     _, final_pid = self.ali.clean_url(final_link)
                     current_id = final_pid if final_pid else str(hash(final_link))
                     
@@ -245,17 +228,14 @@ class AffiliateBot:
                         logger.info(f"⏩ Duplicate after resolve: {current_id}")
                         continue
 
-                    # יצירת טקסט
                     price_match = re.search(r"(₪|\$)\s?\d+(\.\d+)?", msg.text)
                     price = price_match.group(0) if price_match else ""
                     caption = self.writer.create_caption(msg.text, price)
 
-                    # ID נסתר למעקב
                     hidden_id = f"[‎](http://bot-id/{current_id})"
                     final_msg = f"{hidden_id}{caption}\n\n👇 לרכישה:\n{final_link}"
 
                     try:
-                        # תמיכה חכמה במדיה (כולל וידאו!)
                         if msg.media:
                             await self.client.send_file(Config.TARGET_CHANNEL, msg.media, caption=final_msg)
                         else:
@@ -265,7 +245,6 @@ class AffiliateBot:
                         self.history.add(current_id)
                         processed_count += 1
                         
-                        # המתנה רנדומלית (נראה אנושי יותר)
                         wait_time = random.randint(Config.MIN_DELAY, Config.MIN_DELAY + 5)
                         time.sleep(wait_time)
                         
