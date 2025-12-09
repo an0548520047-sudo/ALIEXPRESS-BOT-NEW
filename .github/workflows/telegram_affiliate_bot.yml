@@ -45,8 +45,19 @@ jobs:
         run: |
           pip install telethon openai httpx
 
+      # דיבאג: הדפסת מבנה הקבצים כדי לוודא שתיקיית bot קיימת
+      - name: Debug - Show Files
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Files in current directory:"
+          ls -la
+          echo "Files inside bot folder (if exists):"
+          ls -la bot || echo "No bot folder found!"
+
       - name: Run bot
         run: |
+          echo "🚀 STARTING BOT EXECUTION..."
           python -m bot.main
 
       - name: Save history
@@ -56,3 +67,4 @@ jobs:
           git config --global user.email "bot@example.com"
           git add -f history.txt || true
           git commit -m "Update history" || true
+          git push
