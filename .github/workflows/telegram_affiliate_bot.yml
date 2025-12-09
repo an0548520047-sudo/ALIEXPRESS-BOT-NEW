@@ -2,8 +2,12 @@ name: Telegram Affiliate Bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+    - cron: "*/30 * * * *"  # רץ כל 30 דקות
+  workflow_dispatch:        # מאפשר הרצה ידנית
+
+# הענקת הרשאות כתיבה לבוט כדי שיוכל לשמור את ההיסטוריה
+permissions:
+  contents: write
 
 jobs:
   run-bot:
@@ -17,17 +21,14 @@ jobs:
       TG_TARGET_CHANNEL: ${{ secrets.TG_TARGET_CHANNEL }}
       ALIEXPRESS_APP_KEY: ${{ secrets.ALIEXPRESS_APP_KEY }}
       ALIEXPRESS_APP_SECRET: ${{ secrets.ALIEXPRESS_APP_SECRET }}
-      AFFILIATE_API_ENDPOINT: "https://api-sg.aliexpress.com/sync"
-      AFFILIATE_API_TIMEOUT: "15"
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-4o-mini"
-      MAX_POSTS_PER_RUN: "10"
-      MAX_MESSAGES_PER_CHANNEL: "50"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # טעינת היסטוריה מהזיכרון של גיטהאב (אם קיים)
       - name: Load history cache
         uses: actions/cache@v4
         with:
@@ -45,26 +46,21 @@ jobs:
         run: |
           pip install telethon openai httpx
 
-      # דיבאג: הדפסת מבנה הקבצים כדי לוודא שתיקיית bot קיימת
-      - name: Debug - Show Files
-        run: |
-          echo "Current directory:"
-          pwd
-          echo "Files in current directory:"
-          ls -la
-          echo "Files inside bot folder (if exists):"
-          ls -la bot || echo "No bot folder found!"
-
       - name: Run bot
         run: |
-          echo "🚀 STARTING BOT EXECUTION..."
           python -m bot.main
 
-      - name: Save history
+      # שמירת קובץ ההיסטוריה חזרה ל-Repository
+      - name: Save history to Git
         if: always()
         run: |
           git config --global user.name "Bot"
           git config --global user.email "bot@example.com"
           git add -f history.txt || true
-          git commit -m "Update history" || true
-          git push
+          # נבדוק אם יש שינויים לפני שננסה לעשות קומיט
+          if git diff --staged --quiet; then
+            echo "No changes to history."
+          else
+            git commit -m "Update history [skip ci]"
+            git push
+          fi
