@@ -79,9 +79,6 @@ class AliExpressClient:
                 response = client.post(self.gateway, data=all_params, headers=headers)
                 data = response.json()
                 
-                # הדפסת דיבאג מלאה לכל תשובה - כדי שנראה מה באמת חוזר
-                # logger.info(f"DEBUG RESPONSE: {json.dumps(data)}") 
-                
                 if "error_response" in data:
                     logger.error(f"⚠️ API Error Response: {json.dumps(data)}")
                     return None
@@ -91,7 +88,6 @@ class AliExpressClient:
             return None
 
     def get_details(self, product_id):
-        # שינוי אסטרטגיה: מבקשים בדולרים ובאנגלית כדי למנוע חסימות אזוריות
         params = {
             "product_ids": product_id,
             "target_currency": "USD", 
@@ -105,7 +101,6 @@ class AliExpressClient:
             resp_root = res.get("aliexpress_affiliate_product_detail_get_response", {})
             resp_result = resp_root.get("resp_result", {})
             
-            # בדיקת הצלחה (200)
             if resp_result.get("resp_code") == 200:
                 result = resp_result.get("result", {})
                 products = result.get("products", {}).get("product")
@@ -113,11 +108,9 @@ class AliExpressClient:
                 if products:
                     return products[0]
                 else:
-                    # כאן נראה את הסיבה האמיתית אם הרשימה ריקה
                     logger.warning(f"⚠️ Empty product list for ID: {product_id}. Full JSON: {json.dumps(res)}")
                     return None
             else:
-                 # הדפסת שגיאה עסקית מפורטת יותר
                  msg = resp_result.get('resp_msg', 'Unknown')
                  code = resp_result.get('resp_code', 'Unknown')
                  logger.warning(f"⚠️ Business Logic Error for {product_id}: Code={code}, Msg={msg}")
@@ -142,22 +135,49 @@ class AliExpressClient:
             return None
 
 # ==========================================
-# כלי עזר
+# כלי עזר - תיקון זיהוי ID
 # ==========================================
 def extract_id(url):
+    # עדיפות 1: מזהה גלובלי רגיל (1005...)
+    match = re.search(r'/item/(1005\d{10,})\.html', url)
+    if match: return match.group(1)
+    
+    # עדיפות 2: כל מספר ארוך אחר (אם זה ה-ID היחיד שיש)
     match = re.search(r'/item/(\d+)\.html', url)
     if match: return match.group(1)
-    match = re.search(r'(\d{11,})', url)
-    if match: return match.group(1)
+    
     return None
 
 def resolve_url(url):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"}
-        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+        # שימוש בקוקיז כדי לכפות את האתר הגלובלי (Global Site) ולא US
+        cookies = {
+            "xman_us_f": "x_l=0&x_locale=en_US", 
+            "int_locale": "en_US",
+            "aep_usuc_f": "region=IL&site=glo&b_locale=en_US&c_tp=USD" # Force Israel/Global
+        }
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+        }
+        
+        # לא עוקבים אחרי הפניות אוטומטית בצורה עיוורת
+        # אלא בודקים אם ההפניה הראשונה מספיקה או אם היא זורקת ל-us
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers, cookies=cookies) as client:
             resp = client.head(url)
-            if resp.status_code >= 400: return url
-            return str(resp.url).split('?')[0]
+            final_url = str(resp.url)
+            
+            # אם קיבלנו קישור ל-aliexpress.us, ננסה להמיר אותו חזרה ל-global
+            # על ידי לקיחת ה-ID מה-URL המקורי או חיפוש ID בקוד
+            if "aliexpress.us" in final_url:
+                # ננסה לחלץ ID מה-URL הסופי ולבנות URL גלובלי
+                us_id_match = re.search(r'/item/(\d+)\.html', final_url)
+                if us_id_match:
+                     # זה הימור, אבל עדיף מכלום. לפעמים ה-ID האמריקאי עובד אם משנים דומיין.
+                     # אבל עדיף לנסות לחלץ מהפנייה הקודמת אם אפשר (כרגע פשוט נחזיר את זה ונראה)
+                     return final_url.replace("aliexpress.us", "aliexpress.com")
+            
+            return final_url.split('?')[0]
     except:
         return url
 
@@ -178,7 +198,7 @@ class AIWriter:
             return "דיל שווה בטירוף! אל תפספסו 👇"
 
 async def main():
-    logger.info("🚀 Starting Bot (Global USD Fix)...")
+    logger.info("🚀 Starting Bot (US Redirect Fix)...")
     
     try:
         client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
@@ -203,7 +223,10 @@ async def main():
                     
                     real_url = resolve_url(link)
                     pid = extract_id(real_url)
-                    if not pid: continue
+                    
+                    if not pid: 
+                        logger.warning(f"⏩ No ID found in: {real_url}")
+                        continue
                     
                     logger.info(f"🔎 Found ID: {pid}")
                     details = ali.get_details(pid)
@@ -216,9 +239,7 @@ async def main():
                         logger.warning(f"⏩ Skipping {pid} - Link gen failed.")
                         continue
                     
-                    # המרה פשוטה לתצוגה אם צריך, כרגע נציג מה שחזר (USD)
                     price = str(details.get("target_sale_price", "??")) + " " + str(details.get("target_sale_price_currency", "USD"))
-                    
                     caption = ai.generate(details.get("product_title", "מוצר חדש"), price)
                     final_msg = f"{caption}\n\n👇 לרכישה:\n{aff_link}"
                     
