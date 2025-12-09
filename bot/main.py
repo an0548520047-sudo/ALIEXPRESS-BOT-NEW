@@ -79,6 +79,9 @@ class AliExpressClient:
                 response = client.post(self.gateway, data=all_params, headers=headers)
                 data = response.json()
                 
+                # הדפסת דיבאג מלאה לכל תשובה - כדי שנראה מה באמת חוזר
+                # logger.info(f"DEBUG RESPONSE: {json.dumps(data)}") 
+                
                 if "error_response" in data:
                     logger.error(f"⚠️ API Error Response: {json.dumps(data)}")
                     return None
@@ -88,23 +91,21 @@ class AliExpressClient:
             return None
 
     def get_details(self, product_id):
-        # תיקון קריטי: בקשת שדות ספציפיים
-        fields = "product_id,product_title,product_video_url,product_main_image_url,target_sale_price,target_sale_price_currency,evaluate_rate,last_volume"
-        
+        # שינוי אסטרטגיה: מבקשים בדולרים ובאנגלית כדי למנוע חסימות אזוריות
         params = {
             "product_ids": product_id,
-            "target_currency": "ILS",
-            "target_language": "HE",
-            "fields": fields 
+            "target_currency": "USD", 
+            "target_language": "EN"
         }
         
         res = self.execute("aliexpress.affiliate.product.detail.get", params)
         if not res: return None
         
         try:
-            resp_result = res.get("aliexpress_affiliate_product_detail_get_response", {}).get("resp_result", {})
+            resp_root = res.get("aliexpress_affiliate_product_detail_get_response", {})
+            resp_result = resp_root.get("resp_result", {})
             
-            # בדיקת קוד הצלחה פנימי
+            # בדיקת הצלחה (200)
             if resp_result.get("resp_code") == 200:
                 result = resp_result.get("result", {})
                 products = result.get("products", {}).get("product")
@@ -112,14 +113,18 @@ class AliExpressClient:
                 if products:
                     return products[0]
                 else:
-                    logger.warning(f"⚠️ Empty product list for ID: {product_id}. Raw Result: {json.dumps(result)}")
+                    # כאן נראה את הסיבה האמיתית אם הרשימה ריקה
+                    logger.warning(f"⚠️ Empty product list for ID: {product_id}. Full JSON: {json.dumps(res)}")
                     return None
             else:
-                 logger.warning(f"⚠️ Business Logic Error for {product_id}: {resp_result.get('resp_msg')}")
+                 # הדפסת שגיאה עסקית מפורטת יותר
+                 msg = resp_result.get('resp_msg', 'Unknown')
+                 code = resp_result.get('resp_code', 'Unknown')
+                 logger.warning(f"⚠️ Business Logic Error for {product_id}: Code={code}, Msg={msg}")
                  return None
 
         except Exception as e:
-            logger.error(f"Parsing Error: {e} | Raw Data: {str(res)[:500]}")
+            logger.error(f"Parsing Error: {e}")
             return None
 
     def generate_link(self, original_url):
@@ -173,7 +178,7 @@ class AIWriter:
             return "דיל שווה בטירוף! אל תפספסו 👇"
 
 async def main():
-    logger.info("🚀 Starting Bot (Field Fix)...")
+    logger.info("🚀 Starting Bot (Global USD Fix)...")
     
     try:
         client = TelegramClient(StringSession(Config.SESSION_STR), Config.API_ID, Config.API_HASH)
@@ -211,7 +216,9 @@ async def main():
                         logger.warning(f"⏩ Skipping {pid} - Link gen failed.")
                         continue
                     
-                    price = str(details.get("target_sale_price", "??")) + " " + str(details.get("target_sale_price_currency", "ILS"))
+                    # המרה פשוטה לתצוגה אם צריך, כרגע נציג מה שחזר (USD)
+                    price = str(details.get("target_sale_price", "??")) + " " + str(details.get("target_sale_price_currency", "USD"))
+                    
                     caption = ai.generate(details.get("product_title", "מוצר חדש"), price)
                     final_msg = f"{caption}\n\n👇 לרכישה:\n{aff_link}"
                     
