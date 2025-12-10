@@ -51,7 +51,7 @@ class Config:
         return True
 
 # ==========================================
-# 2. מנהל עליאקספרס (מנגנון המרה משופר)
+# 2. מנהל עליאקספרס
 # ==========================================
 class AliExpressHandler:
     def __init__(self):
@@ -65,9 +65,7 @@ class AliExpressHandler:
         return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
 
     def clean_url(self, url):
-        """מנקה זבל מהלינק ומחלץ ID"""
         try:
-            # פתיחת קיצורים נפוצים
             if any(x in url for x in ['bit.ly', 't.me', 'tinyurl', 's.click', 'a.aliexpress']):
                 with httpx.Client(follow_redirects=True, timeout=10) as client:
                     resp = client.head(url)
@@ -85,9 +83,8 @@ class AliExpressHandler:
             return url, None
 
     def generate_affiliate_link(self, url, retries=3):
-        """מנסה לייצר לינק שותף, עם לוגיקה חכמה לטיפול בשגיאות"""
         clean_link, _ = self.clean_url(url)
-        logger.info(f"🔌 Converting link: {clean_link}")
+        logger.info(f"🔌 Generating link for: {clean_link}")
 
         params = {
             "app_key": self.key,
@@ -108,37 +105,26 @@ class AliExpressHandler:
                     resp = client.post(self.gateway, data=params)
                     data = resp.json()
                     
-                    # 1. ניסיון לחלץ מהמבנה הסטנדרטי
                     if "aliexpress_affiliate_link_generate_response" in data:
                         root = data["aliexpress_affiliate_link_generate_response"]
                         if "resp_result" in root and "result" in root["resp_result"]:
                             promos = root["resp_result"]["result"]["promotion_links"]["promotion_link"]
                             return promos[0]["promotion_link"]
                     
-                    # 2. ניסיון לחלץ ממבנה שטוח (לפעמים קורה)
                     if "result" in data and "promotion_links" in data["result"]:
                         promos = data["result"]["promotion_links"]["promotion_link"]
                         return promos[0]["promotion_link"]
 
-                    # 3. טיפול בשגיאות
                     if "error_response" in data:
-                        msg = data["error_response"].get("msg", "Unknown")
-                        # אם המוצר לא נמצא או הלינק לא חוקי, אין טעם לנסות שוב
-                        if "Invalid" in msg or "found" in msg:
-                            logger.warning(f"⚠️ API Rejected: {msg}")
-                            break
-                        logger.warning(f"⚠️ API Error: {msg}")
-                    else:
-                        # אם המבנה לא מוכר, נדפיס אותו כדי שנוכל לתקן
-                        logger.info(f"🔍 Unknown JSON: {json.dumps(data)}")
-
+                        logger.warning(f"⚠️ API Error: {data['error_response'].get('msg')}")
+                    
                     time.sleep(1)
 
             except Exception as e:
-                logger.warning(f"API Attempt {attempt+1} network error: {e}")
+                logger.warning(f"API Attempt {attempt+1} failed: {e}")
                 time.sleep(2)
         
-        logger.error("⚠️ Failed to generate link. Using fallback (Clean URL).")
+        logger.error("⚠️ Failed to generate affiliate link. Using clean fallback.")
         return clean_link
 
 # ==========================================
@@ -186,4 +172,98 @@ class ContentGenerator:
 # ==========================================
 class AffiliateBot:
     def __init__(self):
-        self.client = TelegramClient(StringSession(Config.
+        self.client = TelegramClient(StringSession(Config.SESSION), Config.API_ID, Config.API_HASH)
+        self.ali = AliExpressHandler()
+        self.writer = ContentGenerator()
+        self.history = set()
+        self.start_time = time.time()
+
+    async def load_history(self):
+        logger.info("📚 Syncing history...")
+        try:
+            async for msg in self.client.iter_messages(Config.TARGET_CHANNEL, limit=150):
+                if msg.entities:
+                    for ent in msg.entities:
+                        if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
+                            match = re.search(r"bot-id/(\d+)", ent.url)
+                            if match: self.history.add(match.group(1))
+                if msg.text:
+                    links = re.findall(r'/item/(\d+)\.html', msg.text)
+                    for pid in links: self.history.add(pid)
+        except Exception as e:
+            logger.warning(f"History warning: {e}")
+        logger.info(f"✅ Loaded {len(self.history)} past items.")
+
+    def should_stop(self):
+        elapsed = (time.time() - self.start_time) / 60
+        if elapsed >= Config.MAX_RUNTIME_MINUTES:
+            logger.info("⏱️ Time limit reached. Stopping safely.")
+            return True
+        return False
+
+    async def run(self):
+        if not Config.validate(): return
+        
+        await self.client.start()
+        await self.load_history()
+        
+        processed_count = 0
+        logger.info("🚀 Bot is running...")
+
+        for source in Config.SOURCE_CHANNELS:
+            logger.info(f"👀 Checking: {source}")
+            try:
+                async for msg in self.client.iter_messages(source, limit=Config.MAX_MESSAGES):
+                    if processed_count >= Config.MAX_POSTS_PER_RUN:
+                        logger.info("🛑 Daily limit reached. Done.")
+                        return
+                    if self.should_stop(): return
+                    if not msg.text: continue
+                    
+                    urls = re.findall(r'(https?://[^\s]+)', msg.text)
+                    valid_urls = [u for u in urls if any(x in u for x in ["aliexpress", "s.click", "bit.ly"])]
+                    if not valid_urls: continue
+                    
+                    original_link = valid_urls[0]
+                    _, pid = self.ali.clean_url(original_link)
+                    if pid and pid in self.history: continue 
+
+                    logger.info(f"💡 Found candidate: {pid}")
+                    
+                    final_link = self.ali.generate_affiliate_link(original_link)
+                    
+                    _, final_pid = self.ali.clean_url(final_link)
+                    current_id = final_pid if final_pid else str(hash(final_link))
+                    
+                    if current_id in self.history:
+                        logger.info(f"⏩ Skipping duplicate: {current_id}")
+                        continue
+
+                    price_match = re.search(r"(₪|\$)\s?\d+(\.\d+)?", msg.text)
+                    price = price_match.group(0) if price_match else ""
+                    caption = self.writer.create_caption(msg.text, price)
+
+                    hidden_id = f"[‎](http://bot-id/{current_id})"
+                    final_msg = f"{hidden_id}{caption}\n\n👇 לרכישה:\n{final_link}"
+
+                    try:
+                        if msg.media:
+                            await self.client.send_file(Config.TARGET_CHANNEL, msg.media, caption=final_msg)
+                        else:
+                            await self.client.send_message(Config.TARGET_CHANNEL, final_msg, link_preview=True)
+                        
+                        logger.info(f"✅ Posted Successfully: {current_id}")
+                        self.history.add(current_id)
+                        processed_count += 1
+                        time.sleep(random.randint(Config.MIN_DELAY, Config.MIN_DELAY + 5))
+                    except Exception as e:
+                        logger.error(f"❌ Send failed: {e}")
+
+            except Exception as e:
+                logger.error(f"Error reading channel: {e}")
+
+        logger.info(f"🏁 Session finished. New posts: {processed_count}")
+
+if __name__ == "__main__":
+    bot = AffiliateBot()
+    asyncio.run(bot.run())
