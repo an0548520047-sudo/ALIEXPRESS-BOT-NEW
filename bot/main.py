@@ -6,7 +6,6 @@ import time
 import hashlib
 import logging
 import random
-from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -18,18 +17,23 @@ from telethon.tl.types import MessageEntityTextUrl
 # ==========================================
 # 1. הגדרות וקונפיגורציה
 # ==========================================
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 class Config:
-    # טלגרם
+    # Telegram Credentials
     API_ID = int(os.environ.get("TG_API_ID", 0))
     API_HASH = os.environ.get("TG_API_HASH")
     SESSION = os.environ.get("TG_SESSION")
+    
+    # Channels
     SOURCE_CHANNELS = [x.strip() for x in os.environ.get("TG_SOURCE_CHANNELS", "").split(",") if x.strip()]
     TARGET_CHANNEL = os.environ.get("TG_TARGET_CHANNEL")
 
-    # עליאקספרס
+    # AliExpress API
     APP_KEY = os.environ.get("ALIEXPRESS_APP_KEY")
     APP_SECRET = os.environ.get("ALIEXPRESS_APP_SECRET")
     API_ENDPOINT = "https://api-sg.aliexpress.com/sync"
@@ -38,26 +42,24 @@ class Config:
     OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
     OPENAI_MODEL = "gpt-4o-mini"
 
-    # הגדרות ריצה
+    # Safety Limits
     MAX_MESSAGES = 50       
     MAX_POSTS_PER_RUN = 8
-    MIN_DELAY = 5
-    
-    # שעות פעילות (השתקתי כרגע כדי למנוע סיבוכים, אבל המבנה מוכן)
-    # אפשר להחזיר אם תרצה בעתיד
+    MIN_DELAY = 6
+    MAX_RUNTIME_MINUTES = 25 
 
     @staticmethod
     def validate():
         if not Config.APP_KEY or not Config.APP_SECRET:
-            logger.critical("❌ Missing AliExpress Keys!")
+            logger.critical("❌ Critical: AliExpress Keys missing!")
             return False
         if not Config.SESSION:
-            logger.critical("❌ Missing Telegram Session!")
+            logger.critical("❌ Critical: Telegram Session missing!")
             return False
         return True
 
 # ==========================================
-# 2. מחלקת לינקים ועליאקספרס
+# 2. מנהל עליאקספרס (עם מנגנון Retry)
 # ==========================================
 class AliExpressHandler:
     def __init__(self):
@@ -71,25 +73,30 @@ class AliExpressHandler:
         return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
 
     def clean_url(self, url):
-        """מנקה פרמטרים ומחלץ ID"""
+        """מנקה זבל מהלינק כדי להבטיח שה-API יקבל אותו"""
         try:
-            if any(x in url for x in ['bit.ly', 't.me', 'tinyurl', 's.click']):
+            # פתיחת קיצורים נפוצים
+            if any(x in url for x in ['bit.ly', 't.me', 'tinyurl', 's.click', 'a.aliexpress']):
                 with httpx.Client(follow_redirects=True, timeout=10) as client:
                     resp = client.head(url)
                     url = str(resp.url)
 
+            # חילוץ ה-ID הנקי
             match = re.search(r'/item/(\d+)\.html', url)
             if match:
-                return f"https://www.aliexpress.com/item/{match.group(1)}.html", match.group(1)
+                clean_id = match.group(1)
+                return f"https://www.aliexpress.com/item/{clean_id}.html", clean_id
             
+            # ניקוי פרמטרים אם לא נמצא ID
             parsed = urlparse(url)
             clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
             return clean, None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"URL Clean warning: {e}")
             return url, None
 
-    def generate_affiliate_link(self, url):
-        """יוצר לינק אפיליאייט דרך ה-API עם Fallback"""
+    def generate_affiliate_link(self, url, retries=3):
+        """יוצר לינק שותף עם ניסיונות חוזרים (Retry Mechanism)"""
         clean_link, _ = self.clean_url(url)
         
         params = {
@@ -105,62 +112,78 @@ class AliExpressHandler:
         }
         params["sign"] = self._sign(params)
 
-        try:
-            with httpx.Client(timeout=15) as client:
-                resp = client.post(self.gateway, data=params)
-                data = resp.json()
-                
-                if "aliexpress_affiliate_link_generate_response" in data:
-                    result = data["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]
-                    return result["promotion_links"]["promotion_link"][0]["promotion_link"]
+        for attempt in range(retries):
+            try:
+                with httpx.Client(timeout=15) as client:
+                    resp = client.post(self.gateway, data=params)
+                    data = resp.json()
                     
-        except Exception as e:
-            logger.error(f"API Error: {e}")
+                    if "aliexpress_affiliate_link_generate_response" in data:
+                        result = data["aliexpress_affiliate_link_generate_response"]["resp_result"]["result"]
+                        # הצלחה! מחזירים את הלינק שלך
+                        return result["promotion_links"]["promotion_link"][0]["promotion_link"]
+                    
+                    # אם יש שגיאה, נחכה רגע וננסה שוב
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.warning(f"API Attempt {attempt+1} failed: {e}")
+                time.sleep(2)
         
+        # אם הכל נכשל, מחזירים את הלינק הנקי (עדיף מכלום)
+        logger.error("⚠️ Failed to generate affiliate link after retries.")
         return clean_link
 
 # ==========================================
-# 3. מחלקת תוכן (AI)
+# 3. יוצר תוכן אנושי (Human-Like AI)
 # ==========================================
 class ContentGenerator:
     def __init__(self):
         self.client = OpenAI(api_key=Config.OPENAI_KEY) if Config.OPENAI_KEY else None
 
     def _sanitize_input(self, text):
+        """מסיר 'רעש' מהטקסט המקורי"""
         text = re.sub(r'https?://\S+', '', text)
-        bad_words = ["הצטרפו", "ערוץ", "join", "channel", "t.me", "@"]
+        bad_words = ["הצטרפו", "ערוץ", "join", "channel", "t.me", "@", "👇", "בלינק"]
         lines = [line for line in text.split('\n') if not any(bw in line.lower() for bw in bad_words)]
         return "\n".join(lines).strip()
 
     def create_caption(self, original_text, price_hint=""):
         if not self.client:
-            return "מציאה חדשה מאליאקספרס! 👇"
+            return "מציאה חדשה! 👇"
 
         clean_text = self._sanitize_input(original_text)
         
-        if len(clean_text) < 10:
-            prompt = f"כתוב משפט שיווקי קצר על 'גאדג'ט מאליאקספרס'. מחיר: {price_hint}."
+        # אם אין מספיק טקסט, נייצר משהו גנרי אך מזמין
+        if len(clean_text) < 15:
+            prompt = f"כתוב המלצה קצרה ומתלהבת בעברית על מוצר מאליאקספרס. מחיר: {price_hint}."
         else:
             prompt = f"""
-            תפקידך: מנהל ערוץ טלגרם מומחה.
-            משימה: שכתב את הטקסט הבא לפוסט מכירתי קצר (מקסימום 3 שורות).
-            טקסט מקור: {clean_text[:400]}
+            אתה מנהל קהילת קניות בטלגרם. החברים סומכים עליך.
+            המשימה: כתוב פוסט המלצה קצר (2-3 משפטים) על בסיס הטקסט למטה.
+            טקסט מקור: {clean_text[:500]}
             מחיר: {price_hint}
-            דרישות: טון מתלהב אבל אמין, השתמש ב-2 אימוג'ים רלוונטיים. בלי האשטאגים.
+            
+            הנחיות קריטיות:
+            1. דבר בגובה העיניים ("מצאתי לכם", "תראו איזה קטע").
+            2. תדגיש למה זה שווה או שימושי.
+            3. אל תשתמש במילים שיווקיות זולות ("מהפכני", "מדהים"). היה אותנטי.
+            4. בלי האשטאגים.
+            5. הוסף אימוג'י אחד או שניים מתאימים.
             """
 
         try:
             resp = self.client.chat.completions.create(
                 model=Config.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=250
+                max_tokens=300
             )
             return resp.choices[0].message.content.strip()
         except Exception:
-            return "דיל שווה בטירוף! אל תפספסו 🔥"
+            return "מצאתי דיל מעניין! שווה בדיקה 👇"
 
 # ==========================================
-# 4. הבוט הראשי
+# 4. הבוט הראשי (המנצח)
 # ==========================================
 class AffiliateBot:
     def __init__(self):
@@ -168,25 +191,37 @@ class AffiliateBot:
         self.ali = AliExpressHandler()
         self.writer = ContentGenerator()
         self.history = set()
+        self.start_time = time.time()
 
     async def load_history(self):
-        logger.info("📚 Loading history...")
+        """טעינת היסטוריה כדי למנוע כפילויות"""
+        logger.info("📚 Syncing history...")
         try:
-            async for msg in self.client.iter_messages(Config.TARGET_CHANNEL, limit=200):
+            async for msg in self.client.iter_messages(Config.TARGET_CHANNEL, limit=150):
+                # זיהוי חכם דרך הלינק הנסתר
                 if msg.entities:
                     for ent in msg.entities:
                         if isinstance(ent, MessageEntityTextUrl) and "bot-id" in ent.url:
                             match = re.search(r"bot-id/(\d+)", ent.url)
                             if match: self.history.add(match.group(1))
                 
+                # זיהוי דרך לינקים רגילים (גיבוי)
                 if msg.text:
                     links = re.findall(r'/item/(\d+)\.html', msg.text)
                     for pid in links: self.history.add(pid)
                     
         except Exception as e:
-            logger.warning(f"History load warning: {e}")
+            logger.warning(f"Minor history warning: {e}")
         
-        logger.info(f"✅ History loaded: {len(self.history)} items.")
+        logger.info(f"✅ Loaded {len(self.history)} past items.")
+
+    def should_stop(self):
+        """בטיחות: האם חרגנו מזמן הריצה?"""
+        elapsed = (time.time() - self.start_time) / 60
+        if elapsed >= Config.MAX_RUNTIME_MINUTES:
+            logger.info("⏱️ Time limit reached. Stopping safely.")
+            return True
+        return False
 
     async def run(self):
         if not Config.validate(): return
@@ -195,66 +230,77 @@ class AffiliateBot:
         await self.load_history()
         
         processed_count = 0
-        logger.info("🚀 Bot started scanning...")
+        logger.info("🚀 Bot is running...")
 
         for source in Config.SOURCE_CHANNELS:
-            logger.info(f"👀 Scanning: {source}")
+            logger.info(f"👀 Checking: {source}")
             try:
                 async for msg in self.client.iter_messages(source, limit=Config.MAX_MESSAGES):
+                    # בדיקות בטיחות ועצירה
                     if processed_count >= Config.MAX_POSTS_PER_RUN:
-                        logger.info("🛑 Reached limits. Bye.")
+                        logger.info("🛑 Daily limit reached. Done for now.")
+                        return
+                    
+                    if self.should_stop():
                         return
 
                     if not msg.text: continue
                     
+                    # חילוץ וסינון לינקים
                     urls = re.findall(r'(https?://[^\s]+)', msg.text)
-                    valid_urls = [u for u in urls if "aliexpress" in u or "s.click" in u or "bit.ly" in u]
+                    valid_urls = [u for u in urls if any(x in u for x in ["aliexpress", "s.click", "bit.ly"])]
                     
                     if not valid_urls: continue
                     
+                    # בדיקה אם כבר טיפלנו במוצר הזה (לפני קריאה ל-API)
                     original_link = valid_urls[0]
                     _, pid = self.ali.clean_url(original_link)
                     
                     if pid and pid in self.history: continue 
 
-                    logger.info(f"🔎 Found deal: {pid or 'Unknown'}")
+                    logger.info(f"💡 Found candidate: {pid}")
                     
+                    # --- רגע האמת: המרה ללינק שותף שלך ---
                     final_link = self.ali.generate_affiliate_link(original_link)
                     
+                    # בדיקה חוזרת למניעת כפילות (למקרה שהלינק היה מקוצר)
                     _, final_pid = self.ali.clean_url(final_link)
                     current_id = final_pid if final_pid else str(hash(final_link))
                     
                     if current_id in self.history:
-                        logger.info(f"⏩ Duplicate after resolve: {current_id}")
+                        logger.info(f"⏩ Skipping duplicate ID: {current_id}")
                         continue
 
+                    # יצירת טקסט חכם
                     price_match = re.search(r"(₪|\$)\s?\d+(\.\d+)?", msg.text)
                     price = price_match.group(0) if price_match else ""
                     caption = self.writer.create_caption(msg.text, price)
 
+                    # החדרת מזהה נסתר למעקב עתידי
                     hidden_id = f"[‎](http://bot-id/{current_id})"
                     final_msg = f"{hidden_id}{caption}\n\n👇 לרכישה:\n{final_link}"
 
                     try:
+                        # שליחה חכמה (תומך וידאו/תמונה/טקסט)
                         if msg.media:
                             await self.client.send_file(Config.TARGET_CHANNEL, msg.media, caption=final_msg)
                         else:
                             await self.client.send_message(Config.TARGET_CHANNEL, final_msg, link_preview=True)
                         
-                        logger.info(f"✅ Posted: {current_id}")
+                        logger.info(f"✅ Posted Successfully: {current_id}")
                         self.history.add(current_id)
                         processed_count += 1
                         
-                        wait_time = random.randint(Config.MIN_DELAY, Config.MIN_DELAY + 5)
-                        time.sleep(wait_time)
+                        # המתנה אקראית כדי להיראות אנושי
+                        time.sleep(random.randint(Config.MIN_DELAY, Config.MIN_DELAY + 5))
                         
                     except Exception as e:
-                        logger.error(f"❌ Send Error: {e}")
+                        logger.error(f"❌ Send failed: {e}")
 
             except Exception as e:
-                logger.error(f"Channel Error: {e}")
+                logger.error(f"Error reading channel: {e}")
 
-        logger.info(f"🏁 Done. Total: {processed_count}")
+        logger.info(f"🏁 Session finished. New posts: {processed_count}")
 
 if __name__ == "__main__":
     bot = AffiliateBot()
