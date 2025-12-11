@@ -51,7 +51,7 @@ class Config:
         return True
 
 # ==========================================
-# 2. מנהל עליאקספרס
+# 2. מנהל עליאקספרס (מנגנון המרה משופר)
 # ==========================================
 class AliExpressHandler:
     def __init__(self):
@@ -65,7 +65,9 @@ class AliExpressHandler:
         return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
 
     def clean_url(self, url):
+        """מנקה זבל מהלינק ומחלץ ID"""
         try:
+            # פתיחת קיצורים נפוצים
             if any(x in url for x in ['bit.ly', 't.me', 'tinyurl', 's.click', 'a.aliexpress']):
                 with httpx.Client(follow_redirects=True, timeout=10) as client:
                     resp = client.head(url)
@@ -83,8 +85,9 @@ class AliExpressHandler:
             return url, None
 
     def generate_affiliate_link(self, url, retries=3):
+        """מנסה לייצר לינק שותף, עם לוגיקה חכמה לטיפול בשגיאות"""
         clean_link, _ = self.clean_url(url)
-        logger.info(f"🔌 Generating link for: {clean_link}")
+        logger.info(f"🔌 Converting link: {clean_link}")
 
         params = {
             "app_key": self.key,
@@ -105,26 +108,37 @@ class AliExpressHandler:
                     resp = client.post(self.gateway, data=params)
                     data = resp.json()
                     
+                    # 1. ניסיון לחלץ מהמבנה הסטנדרטי
                     if "aliexpress_affiliate_link_generate_response" in data:
                         root = data["aliexpress_affiliate_link_generate_response"]
                         if "resp_result" in root and "result" in root["resp_result"]:
                             promos = root["resp_result"]["result"]["promotion_links"]["promotion_link"]
                             return promos[0]["promotion_link"]
                     
+                    # 2. ניסיון לחלץ ממבנה שטוח (לפעמים קורה)
                     if "result" in data and "promotion_links" in data["result"]:
                         promos = data["result"]["promotion_links"]["promotion_link"]
                         return promos[0]["promotion_link"]
 
+                    # 3. טיפול בשגיאות
                     if "error_response" in data:
-                        logger.warning(f"⚠️ API Error: {data['error_response'].get('msg')}")
-                    
+                        msg = data["error_response"].get("msg", "Unknown")
+                        # אם המוצר לא נמצא או הלינק לא חוקי, אין טעם לנסות שוב
+                        if "Invalid" in msg or "found" in msg:
+                            logger.warning(f"⚠️ API Rejected: {msg}")
+                            break
+                        logger.warning(f"⚠️ API Error: {msg}")
+                    else:
+                        # הדפסת דיבאג קריטית - נראה את התשובה המלאה
+                        logger.warning(f"🔍 Unknown JSON Response: {json.dumps(data)}")
+
                     time.sleep(1)
 
             except Exception as e:
-                logger.warning(f"API Attempt {attempt+1} failed: {e}")
+                logger.warning(f"API Attempt {attempt+1} network error: {e}")
                 time.sleep(2)
         
-        logger.error("⚠️ Failed to generate affiliate link. Using clean fallback.")
+        logger.error("⚠️ Failed to generate link. Using fallback (Clean URL).")
         return clean_link
 
 # ==========================================
